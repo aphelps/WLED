@@ -154,6 +154,10 @@
   #include "../usermods/audioreactive/audio_reactive.h"
 #endif
 
+#ifdef USERMOD_AMPWORKS
+  #include "../usermods/ampworks/ampworks.h"
+#endif
+
 #ifdef USERMOD_ANALOG_CLOCK
   #include "../usermods/Analog_Clock/Analog_Clock.h"
 #endif
@@ -385,6 +389,10 @@ void registerUsermods()
 
   #ifdef USERMOD_AUDIOREACTIVE
   UsermodManager::add(new AudioReactive());
+  #endif
+
+  #ifdef USERMOD_AMPWORKS
+  UsermodManager::add(new AMPWorks());
   #endif
 
   #ifdef USERMOD_ANALOG_CLOCK
