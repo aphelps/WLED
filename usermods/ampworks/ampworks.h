@@ -20,26 +20,6 @@
  * 2. Register the usermod by adding #include "usermod_filename.h" in the top and registerUsermod(new MyUsermodClass()) in the bottom of usermods_list.cpp
  */
 
-/*
- * AMP's initial test mode
- */
-uint16_t mode_amp_test(void) {
-  uint32_t cycleTime = 1000 + (255 - SEGMENT.speed)*100;
-  uint32_t it = strip.now / cycleTime;
-  if (it != SEGENV.step) {
-    SEGENV.aux0 = (SEGENV.aux0 +1) % 256;
-    SEGENV.step = it;
-  }
-  SEGMENT.fill(SEGMENT.color_from_palette(SEGENV.aux0,
-                                     true,
-                                        (strip.paletteBlend == 1 || strip.paletteBlend == 3),
-                                        0));
-
-  return FRAMETIME;
-}
-static const char _data_FX_MODE_AMP_TEST[] PROGMEM = "AMP Test Usermod v2@!;!,!;!;01";
-
-
 class AMPWorks : public Usermod {
 
   private:
@@ -106,13 +86,7 @@ class AMPWorks : public Usermod {
      * readFromConfig() is called prior to setup()
      * You can use it to initialize variables, sensors or similar.
      */
-    void setup() override {
-      //Serial.println("Hello from my usermod!");
-
-      strip.addEffect(255, &mode_amp_test, _data_FX_MODE_AMP_TEST);
-
-      initDone = true;
-    }
+    void setup() override;
 
 
     /*
@@ -404,11 +378,6 @@ class AMPWorks : public Usermod {
    //More methods can be added in the future, this example will then be extended.
    //Your usermod will remain compatible as it does not need to implement all methods from the Usermod base class!
 };
-
-
-// add more strings here to reduce flash memory usage
-const char AMPWorks::_name[]    PROGMEM = "ExampleUsermod";
-const char AMPWorks::_enabled[] PROGMEM = "enabled";
 
 
 // implementation of non-inline member methods

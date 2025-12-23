@@ -156,6 +156,7 @@
 
 #ifdef USERMOD_AMPWORKS
   #include "../usermods/ampworks/ampworks.h"
+  #include "../usermods/ampworks/ampworks.cpp"
 #endif
 
 #ifdef USERMOD_ANALOG_CLOCK
