@@ -108,10 +108,11 @@ uint16_t mode_amp_moving_sin(void) {
   uint16_t trailing;
   if (data->center < data->width) trailing = SEGMENT.width() - (data->width - data->center);
   else trailing = data->center - data->width;
-  for (uint16_t offset = 0; offset < speed; offset++) {
+  for (uint16_t offset = 0; offset < data->width; offset++) {
     SEGMENT.setPixelColor((trailing + offset) % SEGMENT.width(), 0);
   }
 
+  /* Update values from the sliders */
   uint8_t speed = map8(SEGMENT.speed, 1, 10);
   data->width = map8(SEGMENT.intensity, 1, 10);
 
@@ -130,7 +131,7 @@ uint16_t mode_amp_moving_sin(void) {
   return FRAMETIME;
 }
 // PROGMEM description for audio mode
-static const char _data_FX_MODE_AMP_MOVING_SIN[] PROGMEM = "AMP Moving SIN@Speed,Width;!,!;!;01";
+static const char _data_FX_MODE_AMP_MOVING_SIN[] PROGMEM = "AMP Moving SIN@Speed,Width;!,!;!;01;sx=32";
 
 
 // add more strings here to reduce flash memory usage
