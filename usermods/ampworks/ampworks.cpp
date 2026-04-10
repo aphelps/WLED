@@ -89,49 +89,85 @@ uint16_t mode_amp_ai_audio(void) {
 // PROGMEM description for audio mode
 static const char _data_FX_MODE_AMP_AI_AUDIO[] PROGMEM = "AMP AI Audio@!;!,!;!;01";
 
-struct Moving_Sin {
+struct Moving_Point {
   uint16_t center;
   uint8_t width;
+  int8_t direction; /* Direction of travel, -1 or 1 */
 };
 
-uint16_t mode_amp_moving_sin(void) {
-  if (!SEGENV.allocateData(sizeof(struct Moving_Sin))) return FRAMETIME;
+#define MAX_POINTS 10
+struct Moving_Sin_Data {
+  uint8_t count;
+  struct Moving_Point points[MAX_POINTS];
+};
 
-  struct Moving_Sin *data = (struct Moving_Sin*)SEGENV.data;
-  if (SEGENV.call == 0) {
-    /* Initialization */
-    data->center = random16(SEGMENT.width());
-    SEGMENT.fill(0);
-  }
+static void init_moving_sin_point(struct Moving_Point *data) {
+  data->center = random16(SEGMENT.width());
+  data->direction = (random8() & 1) ? 1 : -1;
+  data->width = 1;
+}
 
-  /* Clear the trailing pixels */
+static void set_moving_sin_point(struct Moving_Point *data, uint32_t color) {
   uint16_t trailing;
   if (data->center < data->width) trailing = SEGMENT.width() - (data->width - data->center);
   else trailing = data->center - data->width;
-  for (uint16_t offset = 0; offset < data->width; offset++) {
-    SEGMENT.setPixelColor((trailing + offset) % SEGMENT.width(), 0);
+  for (uint16_t offset = 0; offset < data->width * 2; offset++) {
+    SEGMENT.setPixelColor((trailing + offset) % SEGMENT.width(), color);
+  }
+}
+
+uint16_t mode_amp_moving_sin(void) {
+  uint8_t points = map8(SEGMENT.custom1, 1, 10);
+  uint8_t i;
+
+  if (!SEGENV.allocateData(sizeof(struct Moving_Sin_Data))) return FRAMETIME;
+
+  struct Moving_Sin_Data *data = (struct Moving_Sin_Data *)SEGENV.data;
+  if (SEGENV.call == 0) {
+    /* Initialization */
+    SEGMENT.fill(0);
+    data->count = points;
+    for (i = 0; i < data->count; i++)
+      init_moving_sin_point(&data->points[i]);
+  }
+
+  /* Clear the trailing pixels */
+  for (i = 0; i < data->count; i++)
+    set_moving_sin_point(&data->points[i], 0);
+
+  if (data->count != points) {
+    /* Need to redo points */
+    data->count = points;
+    for (i = 0; i < data->count; i++)
+      init_moving_sin_point(&data->points[i]);
   }
 
   /* Update values from the sliders */
   uint8_t speed = map8(SEGMENT.speed, 1, 10);
-  data->width = map8(SEGMENT.intensity, 1, 10);
+  uint8_t width = map8(SEGMENT.intensity, 1, 10);
 
-  data->center = (data->center + speed) % SEGMENT.width();
-  if (data->width >= data->center) trailing = 0;
-  else trailing = data->center - data->width;
+  for (i = 0; i < data->count; i++) {
+    auto *point = &data->points[i];
+    point->width = width;
 
-  uint16_t lead = data->center + data->width;
-  if ((lead >= SEGMENT.width()) || (lead < data->center))
-    lead = SEGMENT.width() - 1;
+    if (point->direction > 0) {
+      /* Add the speed, wrapping around the end of the segment */
+      point->center = (point->center + speed) % SEGMENT.width();
+    } else {
+      /* Add the speed, wrapping around the beginning of the segment */
+      if (speed > point->center)
+        point->center = SEGMENT.width() - (speed - point->center);
+      else
+        point->center = point->center - speed;
+    }
 
-  for (uint16_t i = trailing; i <= lead ; i++) {
-    SEGMENT.setPixelColor(i, SEGCOLOR(0));
+    set_moving_sin_point(point, SEGCOLOR(i));
   }
 
   return FRAMETIME;
 }
 // PROGMEM description for audio mode
-static const char _data_FX_MODE_AMP_MOVING_SIN[] PROGMEM = "AMP Moving SIN@Speed,Width;!,!;!;01;sx=32";
+static const char _data_FX_MODE_AMP_MOVING_SIN[] PROGMEM = "AMP Moving SIN@Speed,Width,Points;!,!;!;01;sx=32,c1=1";
 
 
 // add more strings here to reduce flash memory usage
