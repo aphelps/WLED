@@ -170,6 +170,59 @@ uint16_t mode_amp_moving_sin(void) {
 static const char _data_FX_MODE_AMP_MOVING_SIN[] PROGMEM = "AMP Moving SIN@Speed,Width,Points;!,!;!;01;sx=32,c1=1";
 
 
+/*
+ * HMTL Sparkle: reproduces the HMTL "sparkle" program.
+ *
+ * Each update period, every pixel independently rolls a random chance to:
+ *   - Become a new sparkle color drawn from the active palette
+ *   - Reset to the background color (Color 2 slot)
+ *   - Stay unchanged (providing persistence/decay between frames)
+ *
+ * Parameters:
+ *   Speed     → update rate (high = faster flicker)
+ *   Intensity → sparkle probability per pixel per frame (0–100%)
+ *   c1        → background-reset probability per pixel per frame (0–100%)
+ *   Color 2   → background color
+ *   Palette   → sparkle color source
+ */
+uint16_t mode_hmtl_sparkle(void) {
+  if (SEGLEN == 0) return FRAMETIME;
+
+  // On first call fill with the background color so pixels start clean
+  if (SEGENV.call == 0) {
+    SEGMENT.fill(SEGCOLOR(1));
+  }
+
+  // Higher speed → shorter cycle time (faster updates); matches HMTL default ~50ms at mid-speed
+  uint32_t cycleTime = 10 + (255 - SEGMENT.speed) * 2;
+  uint32_t it = strip.now / cycleTime;
+  if (it == SEGENV.step) return FRAMETIME; // period not yet elapsed
+  SEGENV.step = it;
+
+  // sparkle_thresh: per-pixel % chance to become a fresh sparkle color (0–100)
+  uint8_t sparkle_thresh = map8(SEGMENT.intensity, 0, 100);
+  // bg_thresh: combined upper bound — pixels below sparkle_thresh sparkle,
+  //            pixels between sparkle_thresh and bg_thresh reset to background,
+  //            pixels above bg_thresh are left unchanged (HMTL behaviour)
+  uint8_t bg_thresh = sparkle_thresh + map8(SEGMENT.custom1, 0, 100);
+
+  for (uint16_t i = 0; i < SEGLEN; i++) {
+    uint8_t r = random8(100);
+    if (r < sparkle_thresh) {
+      SEGMENT.setPixelColor(i, SEGMENT.color_from_palette(random8(), true, false, 255));
+    } else if (r < bg_thresh) {
+      SEGMENT.setPixelColor(i, SEGCOLOR(1));
+    }
+    // else: leave pixel colour unchanged from previous frame
+  }
+
+  return FRAMETIME;
+}
+// Speed = update rate; Intensity = sparkle probability; c1 = BG reset probability
+// Color 1 = sparkle base (palette), Color 2 = background
+static const char _data_FX_MODE_HMTL_SPARKLE[] PROGMEM = "HMTL Sparkle@Rate,Sparkle,BG Reset;!,!;!;01;sx=128,ix=50,c1=20";
+
+
 // add more strings here to reduce flash memory usage
 const char AMPWorks::_name[]    PROGMEM = "AMPWorks";
 const char AMPWorks::_enabled[] PROGMEM = "enabled";
@@ -181,6 +234,7 @@ void AMPWorks::setup() {
   strip.addEffect(255, &mode_amp_ai, _data_FX_MODE_AMP_AI); // register AMP AI mode
   strip.addEffect(255, &mode_amp_ai_audio, _data_FX_MODE_AMP_AI_AUDIO); // register AMP AI audio mode
   strip.addEffect(255, &mode_amp_moving_sin, _data_FX_MODE_AMP_MOVING_SIN);
+  strip.addEffect(255, &mode_hmtl_sparkle, _data_FX_MODE_HMTL_SPARKLE);
 
   initDone = true;
 }
