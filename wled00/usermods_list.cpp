@@ -159,6 +159,10 @@
   #include "../usermods/ampworks/ampworks.cpp"
 #endif
 
+#ifdef USERMOD_MPR121
+  #include "../usermods/mpr121/usermod_mpr121.h"
+#endif
+
 #ifdef USERMOD_ANALOG_CLOCK
   #include "../usermods/Analog_Clock/Analog_Clock.h"
 #endif
@@ -394,6 +398,10 @@ void registerUsermods()
 
   #ifdef USERMOD_AMPWORKS
   UsermodManager::add(new AMPWorks());
+  #endif
+
+  #ifdef USERMOD_MPR121
+  UsermodManager::add(new UsermodMPR121());
   #endif
 
   #ifdef USERMOD_ANALOG_CLOCK

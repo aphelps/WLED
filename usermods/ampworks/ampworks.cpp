@@ -1,4 +1,7 @@
 #include "ampworks.h"
+#ifdef USERMOD_MPR121
+  #include "../usermods/mpr121/usermod_mpr121.h"
+#endif
 
 /*
  * AMP's initial test mode
@@ -223,6 +226,57 @@ uint16_t mode_hmtl_sparkle(void) {
 static const char _data_FX_MODE_HMTL_SPARKLE[] PROGMEM = "HMTL Sparkle@Rate,Sparkle,BG Reset;!,!;!;01;sx=128,ix=50,c1=20";
 
 
+/*
+ * Touch Ripple: reacts to MPR121 capacitive touch sensor data (USERMOD_ID_MPR121).
+ *
+ * Each of the 12 electrodes maps to an evenly-spaced anchor point along the segment.
+ * Touching an electrode radiates a bright pulse outward with linear falloff.
+ * Electrode 12 (proximity) adds a dim global glow proportional to proximity.
+ * fade_out() provides natural inter-frame decay.
+ *
+ * Requires the mpr121 usermod to be enabled and configured.
+ */
+uint16_t mode_touch_ripple(void) {
+#ifndef USERMOD_MPR121
+  return FRAMETIME;
+#else
+  if (SEGLEN == 0) return FRAMETIME;
+
+  UsermodMPR121 *mpr = (UsermodMPR121*) UsermodManager::lookup(USERMOD_ID_MPR121);
+  if (!mpr || !mpr->isSensorFound()) return FRAMETIME;
+
+  mpr->setUpdateHz(map8(SEGMENT.custom1, 1, 100));
+
+  SEGMENT.fade_out(220);
+
+  uint8_t rippleHalf = (uint8_t)max(1u, (uint32_t)map8(SEGMENT.speed, 2, SEGLEN / 4));
+
+  for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++) {
+    if (!mpr->touched(e)) continue;
+    uint16_t anchor = (uint32_t)e * SEGLEN / MPR121::MAX_SENSORS;
+    for (int16_t d = -(int16_t)rippleHalf; d <= (int16_t)rippleHalf; d++) {
+      int16_t pos = (int16_t)anchor + d;
+      if (pos < 0 || pos >= (int16_t)SEGLEN) continue;
+      uint8_t bri = scale8((uint8_t)map(abs(d), 0, rippleHalf, 255, 0), SEGMENT.intensity);
+      SEGMENT.addPixelColor((uint16_t)pos, color_blend(BLACK, SEGCOLOR(e % 3), bri));
+    }
+  }
+
+  // Proximity electrode: dim global glow proportional to proximity reading
+  uint16_t prox = mpr->getFiltered(MPR121::PROX_SENSOR);
+  if (prox > 100) {
+    uint8_t proxBri = scale8((uint8_t)constrain(map(prox, 100, 800, 0, 80), 0, 80), SEGMENT.intensity);
+    uint32_t proxCol = color_blend(BLACK, SEGCOLOR(2), proxBri);
+    for (uint16_t i = 0; i < SEGLEN; i++) SEGMENT.addPixelColor(i, proxCol);
+  }
+
+  return FRAMETIME;
+#endif
+}
+static const char _data_FX_MODE_TOUCH_RIPPLE[] PROGMEM =
+  "Touch Ripple@Speed,Intensity,Hz;!,!,!;!;01;c1=50";
+
+
 // add more strings here to reduce flash memory usage
 const char AMPWorks::_name[]    PROGMEM = "AMPWorks";
 const char AMPWorks::_enabled[] PROGMEM = "enabled";
@@ -235,6 +289,7 @@ void AMPWorks::setup() {
   strip.addEffect(255, &mode_amp_ai_audio, _data_FX_MODE_AMP_AI_AUDIO); // register AMP AI audio mode
   strip.addEffect(255, &mode_amp_moving_sin, _data_FX_MODE_AMP_MOVING_SIN);
   strip.addEffect(255, &mode_hmtl_sparkle, _data_FX_MODE_HMTL_SPARKLE);
+  strip.addEffect(255, &mode_touch_ripple, _data_FX_MODE_TOUCH_RIPPLE);
 
   initDone = true;
 }
