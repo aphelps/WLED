@@ -634,6 +634,11 @@ void serializeInfo(JsonObject root)
   root[F("release")] = releaseString;
   root[F("repo")] = repoString;
   root[F("deviceId")] = getDeviceId();
+#ifdef WLED_GIT_HASH
+  root[F("git")]    = WLED_GIT_HASH;
+  root[F("branch")] = WLED_GIT_BRANCH;
+  root[F("built")]  = WLED_BUILD_TIME;
+#endif
 
   JsonObject leds = root.createNestedObject(F("leds"));
   leds[F("count")] = strip.getLengthTotal();
