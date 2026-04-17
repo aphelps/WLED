@@ -174,56 +174,70 @@ static const char _data_FX_MODE_AMP_MOVING_SIN[] PROGMEM = "AMP Moving SIN@Speed
 
 
 /*
- * HMTL Sparkle: reproduces the HMTL "sparkle" program.
+ * HMTL Sparkle: reproduces the HMTL "sparkle" program with smooth fading.
  *
  * Each update period, every pixel independently rolls a random chance to:
  *   - Become a new sparkle color drawn from the active palette
  *   - Reset to the background color (Color 2 slot)
- *   - Stay unchanged (providing persistence/decay between frames)
+ *   - Stay unchanged
+ *
+ * Instead of snapping instantly, pixels blend toward their target color each
+ * frame. Fade Speed (c2) controls how quickly pixels reach their target:
+ * low = slow dissolve, high = instant snap.
  *
  * Parameters:
- *   Speed     → update rate (high = faster flicker)
- *   Intensity → sparkle probability per pixel per frame (0–100%)
- *   c1        → background-reset probability per pixel per frame (0–100%)
- *   Color 2   → background color
- *   Palette   → sparkle color source
+ *   Speed      → update rate (high = faster flicker)
+ *   Intensity  → sparkle probability per pixel per frame (0–100%)
+ *   c1         → background-reset probability per pixel per frame (0–100%)
+ *   c2         → fade speed (blend step per frame; 255 = instant)
+ *   Color 2    → background color
+ *   Palette    → sparkle color source
  */
 uint16_t mode_hmtl_sparkle(void) {
   if (SEGLEN == 0) return FRAMETIME;
 
-  // On first call fill with the background color so pixels start clean
+  unsigned dataSize = sizeof(uint32_t) * SEGLEN;
+  if (!SEGENV.allocateData(dataSize)) { SEGMENT.fill(SEGCOLOR(1)); return FRAMETIME; }
+  uint32_t* targets = reinterpret_cast<uint32_t*>(SEGENV.data);
+
   if (SEGENV.call == 0) {
     SEGMENT.fill(SEGCOLOR(1));
+    for (uint16_t i = 0; i < SEGLEN; i++) targets[i] = SEGCOLOR(1);
   }
 
-  // Higher speed → shorter cycle time (faster updates); matches HMTL default ~50ms at mid-speed
+  // On each cycle tick, assign new targets via per-pixel dice roll
   uint32_t cycleTime = 10 + (255 - SEGMENT.speed) * 2;
   uint32_t it = strip.now / cycleTime;
-  if (it == SEGENV.step) return FRAMETIME; // period not yet elapsed
-  SEGENV.step = it;
+  if (it != SEGENV.step) {
+    SEGENV.step = it;
 
-  // sparkle_thresh: per-pixel % chance to become a fresh sparkle color (0–100)
-  uint8_t sparkle_thresh = map8(SEGMENT.intensity, 0, 100);
-  // bg_thresh: combined upper bound — pixels below sparkle_thresh sparkle,
-  //            pixels between sparkle_thresh and bg_thresh reset to background,
-  //            pixels above bg_thresh are left unchanged (HMTL behaviour)
-  uint8_t bg_thresh = sparkle_thresh + map8(SEGMENT.custom1, 0, 100);
+    // sparkle_thresh: per-pixel % chance to become a fresh sparkle color (0–100)
+    uint8_t sparkle_thresh = map8(SEGMENT.intensity, 0, 100);
+    // bg_thresh: pixels between sparkle_thresh and bg_thresh reset to background
+    uint8_t bg_thresh = sparkle_thresh + map8(SEGMENT.custom1, 0, 100);
 
-  for (uint16_t i = 0; i < SEGLEN; i++) {
-    uint8_t r = random8(100);
-    if (r < sparkle_thresh) {
-      SEGMENT.setPixelColor(i, SEGMENT.color_from_palette(random8(), true, false, 255));
-    } else if (r < bg_thresh) {
-      SEGMENT.setPixelColor(i, SEGCOLOR(1));
+    for (uint16_t i = 0; i < SEGLEN; i++) {
+      uint8_t r = random8(100);
+      if (r < sparkle_thresh) {
+        targets[i] = SEGMENT.color_from_palette(random8(), true, false, 255);
+      } else if (r < bg_thresh) {
+        targets[i] = SEGCOLOR(1);
+      }
+      // else: target unchanged — pixel continues fading toward existing target
     }
-    // else: leave pixel colour unchanged from previous frame
+  }
+
+  // Each frame, blend every pixel one step toward its target
+  uint8_t fade_step = SEGMENT.custom2 ? SEGMENT.custom2 : 1;
+  for (uint16_t i = 0; i < SEGLEN; i++) {
+    SEGMENT.blendPixelColor(i, targets[i], fade_step);
   }
 
   return FRAMETIME;
 }
-// Speed = update rate; Intensity = sparkle probability; c1 = BG reset probability
+// Speed = update rate; Intensity = sparkle %; c1 = BG reset %; c2 = fade speed
 // Color 1 = sparkle base (palette), Color 2 = background
-static const char _data_FX_MODE_HMTL_SPARKLE[] PROGMEM = "HMTL Sparkle@Rate,Sparkle,BG Reset;!,!;!;01;sx=128,ix=50,c1=20";
+static const char _data_FX_MODE_HMTL_SPARKLE[] PROGMEM = "HMTL Sparkle@Rate,Sparkle,BG Reset,Fade;!,!;!;01;sx=128,ix=50,c1=20,c2=32";
 
 
 /*
