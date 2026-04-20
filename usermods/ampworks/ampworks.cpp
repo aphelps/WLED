@@ -174,56 +174,92 @@ static const char _data_FX_MODE_AMP_MOVING_SIN[] PROGMEM = "AMP Moving SIN@Speed
 
 
 /*
- * HMTL Sparkle: reproduces the HMTL "sparkle" program.
+ * HMTL Sparkle: reproduces the HMTL "sparkle" program with smooth fading.
  *
  * Each update period, every pixel independently rolls a random chance to:
  *   - Become a new sparkle color drawn from the active palette
  *   - Reset to the background color (Color 2 slot)
- *   - Stay unchanged (providing persistence/decay between frames)
+ *   - Stay unchanged
+ *
+ * Instead of snapping instantly, each channel steps toward the target by at
+ * most `fade_step` per frame. Channel-delta stepping guarantees monotonic
+ * convergence at all fade speeds, avoiding the blendPixelColor integer-
+ * truncation stall that causes fade-to-black artifacts at small blend values.
+ * Current color is read back via getPixelColor (returns raw set value) so no
+ * separate per-pixel current-state buffer is needed.
  *
  * Parameters:
- *   Speed     → update rate (high = faster flicker)
- *   Intensity → sparkle probability per pixel per frame (0–100%)
- *   c1        → background-reset probability per pixel per frame (0–100%)
- *   Color 2   → background color
- *   Palette   → sparkle color source
+ *   Speed      → update rate (high = faster flicker)
+ *   Intensity  → sparkle probability per pixel per frame (0–100%)
+ *   c1         → background-reset probability per pixel per frame (0–100%)
+ *   c2         → fade speed (0 = instant snap, 255 = very slow dissolve; cubic curve)
+ *   Color 2    → background color
+ *   Palette    → sparkle color source
  */
 uint16_t mode_hmtl_sparkle(void) {
   if (SEGLEN == 0) return FRAMETIME;
 
-  // On first call fill with the background color so pixels start clean
+  unsigned dataSize = sizeof(uint32_t) * SEGLEN;
+  if (!SEGENV.allocateData(dataSize)) { SEGMENT.fill(SEGCOLOR(1)); return FRAMETIME; }
+  uint32_t* targets = reinterpret_cast<uint32_t*>(SEGENV.data);
+
   if (SEGENV.call == 0) {
-    SEGMENT.fill(SEGCOLOR(1));
+    uint32_t bg = SEGCOLOR(1);
+    for (uint16_t i = 0; i < SEGLEN; i++) targets[i] = bg;
+    SEGMENT.fill(bg);
   }
 
-  // Higher speed → shorter cycle time (faster updates); matches HMTL default ~50ms at mid-speed
+  // On each cycle tick, assign new targets via per-pixel dice roll
   uint32_t cycleTime = 10 + (255 - SEGMENT.speed) * 2;
   uint32_t it = strip.now / cycleTime;
-  if (it == SEGENV.step) return FRAMETIME; // period not yet elapsed
-  SEGENV.step = it;
+  if (it != SEGENV.step) {
+    SEGENV.step = it;
 
-  // sparkle_thresh: per-pixel % chance to become a fresh sparkle color (0–100)
-  uint8_t sparkle_thresh = map8(SEGMENT.intensity, 0, 100);
-  // bg_thresh: combined upper bound — pixels below sparkle_thresh sparkle,
-  //            pixels between sparkle_thresh and bg_thresh reset to background,
-  //            pixels above bg_thresh are left unchanged (HMTL behaviour)
-  uint8_t bg_thresh = sparkle_thresh + map8(SEGMENT.custom1, 0, 100);
+    // sparkle_thresh: per-pixel % chance to become a fresh sparkle color (0–100)
+    uint8_t sparkle_thresh = map8(SEGMENT.intensity, 0, 100);
+    // bg_thresh: pixels between sparkle_thresh and bg_thresh reset to background
+    uint8_t bg_thresh = sparkle_thresh + map8(SEGMENT.custom1, 0, 100);
 
-  for (uint16_t i = 0; i < SEGLEN; i++) {
-    uint8_t r = random8(100);
-    if (r < sparkle_thresh) {
-      SEGMENT.setPixelColor(i, SEGMENT.color_from_palette(random8(), true, false, 255));
-    } else if (r < bg_thresh) {
-      SEGMENT.setPixelColor(i, SEGCOLOR(1));
+    for (uint16_t i = 0; i < SEGLEN; i++) {
+      uint8_t r = random8(100);
+      if (r < sparkle_thresh) {
+        targets[i] = SEGMENT.color_from_palette(random8(), true, false, 255);
+      } else if (r < bg_thresh) {
+        targets[i] = SEGCOLOR(1);
+      }
+      // else: target unchanged — pixel continues toward existing target
     }
-    // else: leave pixel colour unchanged from previous frame
+  }
+
+  // Cubic curve: inv³/255² stretches the slow end over more slider range than
+  // quadratic. c2=0 → fade_step=255 (instant snap); c2≈212 → fade_step=1
+  // (~8.5 s full range at 30 fps). Integer-only, no powf.
+  uint8_t inv = 255 - SEGMENT.custom2;
+  uint8_t fade_step = (uint8_t)max(1u, (uint32_t)inv * inv * inv / (255u * 255u));
+
+  // Step each channel toward target. getPixelColor returns the raw value last
+  // written by setPixelColor, so reading it back loses no precision.
+  for (uint16_t i = 0; i < SEGLEN; i++) {
+    uint32_t cur = SEGMENT.getPixelColor(i);
+    uint8_t r = R(cur), g = G(cur), b = B(cur);
+    uint8_t tr = R(targets[i]), tg = G(targets[i]), tb = B(targets[i]);
+
+    auto step_ch = [](uint8_t from, uint8_t to, uint8_t step) -> uint8_t {
+      if (from == to) return to;
+      if (from < to) return (uint8_t)((to - from <= step) ? to : from + step);
+      return (uint8_t)((from - to <= step) ? to : from - step);
+    };
+
+    SEGMENT.setPixelColor(i, RGBW32(step_ch(r, tr, fade_step),
+                                     step_ch(g, tg, fade_step),
+                                     step_ch(b, tb, fade_step), 0));
   }
 
   return FRAMETIME;
 }
-// Speed = update rate; Intensity = sparkle probability; c1 = BG reset probability
+// Speed = update rate; Intensity = sparkle %; c1 = BG reset %; c2 = fade speed (0=snap, 255=slow)
 // Color 1 = sparkle base (palette), Color 2 = background
-static const char _data_FX_MODE_HMTL_SPARKLE[] PROGMEM = "HMTL Sparkle@Rate,Sparkle,BG Reset;!,!;!;01;sx=128,ix=50,c1=20";
+static const char _data_FX_MODE_HMTL_SPARKLE[] PROGMEM = "HMTL Sparkle@Rate,Sparkle,BG Reset,Fade;!,!;!;01;sx=128,ix=50,c1=20,c2=200";
 
 
 /*
