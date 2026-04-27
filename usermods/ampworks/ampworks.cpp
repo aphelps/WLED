@@ -497,7 +497,7 @@ uint16_t mode_touch_ripple(void) {
 #endif
 }
 static const char _data_FX_MODE_TOUCH_RIPPLE[] PROGMEM =
-  "Touch Pond@Speed,Intensity,Hz,Trail,Audio;!;!;01;sx=40,ix=220,c1=50,c2=200,c3=0";
+  "Touch Pond@Speed,Intensity,Hz,Trail,Audio;!;!;01;sx=40,ix=220,c1=50,c2=200,c3=50";
 
 
 // add more strings here to reduce flash memory usage
