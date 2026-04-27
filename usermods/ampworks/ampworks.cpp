@@ -410,6 +410,25 @@ uint16_t mode_touch_ripple(void) {
     }
   }
 
+  // Audio-reactive wave spawning: c3 controls sensitivity and brightness of audio-driven waves
+  uint8_t audioMix = SEGMENT.custom3;
+  if (audioMix > 0) {
+    um_data_t *um_data = nullptr;
+    if (!UsermodManager::getUMData(&um_data, USERMOD_ID_AUDIOREACTIVE))
+      um_data = simulateSound(SEGMENT.soundSim);
+    if (um_data) {
+      float volF = *(float*)um_data->u_data[0];
+      if (volF <= 2.0f) volF *= 255.0f;
+      uint8_t vol = (uint8_t)constrain((int)volF, 0, 255);
+      if (SEGENV.aux0 > 0) {
+        SEGENV.aux0--;
+      } else if (vol > (255 - scale8(audioMix, 200))) {
+        spawnTouchWave(data, random8(MPR121::MAX_SENSORS), SEGLEN, maxAge, map8(audioMix, 120, 220));
+        SEGENV.aux0 = map8(255 - audioMix, 3, 20);
+      }
+    }
+  }
+
   // Draw active waves: bright wavefront spike + comet tail; ghost waves dimmed via ghostBri
   for (int w = 0; w < MAX_TOUCH_WAVES; w++) {
     TouchWave &wave = data->waves[w];
@@ -457,7 +476,7 @@ uint16_t mode_touch_ripple(void) {
 #endif
 }
 static const char _data_FX_MODE_TOUCH_RIPPLE[] PROGMEM =
-  "Touch Pond@Speed,Intensity,Hz,Trail;!;!;01;sx=40,ix=220,c1=50,c2=200";
+  "Touch Pond@Speed,Intensity,Hz,Trail,Audio;!;!;01;sx=40,ix=220,c1=50,c2=200,c3=0";
 
 
 // add more strings here to reduce flash memory usage
