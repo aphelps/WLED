@@ -429,14 +429,15 @@ uint16_t mode_touch_ripple(void) {
         data->agcPeak = max((uint8_t)1, (uint8_t)((uint16_t)data->agcPeak * 253 >> 8));
       }
       // Normalize volume relative to recent peak (0-255 = silent to loudest-seen)
-      uint8_t normVol = (data->agcPeak > 10) ?
+      // Floor of 30 prevents ambient noise from triggering after peak decays down
+      uint8_t normVol = (data->agcPeak > 30) ?
         (uint8_t)min(255u, (uint32_t)vol * 255u / data->agcPeak) : 0;
 
       // sqrt curve: half slider (128) maps to ~181/255 effective mix
       uint8_t curvedMix = sqrt16((uint16_t)audioMix * 255);
 
       // Threshold: fraction of recent peak needed to spawn; lower slider = higher bar
-      uint8_t threshold = 255 - scale8(curvedMix, 200);
+      uint8_t threshold = 255 - scale8(curvedMix, 165);
 
       if (SEGENV.aux0 > 0) {
         SEGENV.aux0--;
@@ -444,7 +445,7 @@ uint16_t mode_touch_ripple(void) {
         // Brightness scales with amplitude: louder = brighter (80-220 range)
         uint8_t audioBri = 80 + scale8(normVol, scale8(curvedMix, 140));
         spawnTouchWave(data, random8(MPR121::MAX_SENSORS), SEGLEN, maxAge, audioBri);
-        SEGENV.aux0 = map8(255 - curvedMix, 3, 20);
+        SEGENV.aux0 = map8(255 - curvedMix, 8, 40);
       }
     }
   }
