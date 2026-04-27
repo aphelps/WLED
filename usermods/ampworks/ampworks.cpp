@@ -305,6 +305,7 @@ struct TouchRippleData {
   uint16_t   idleFrames;                 // frames since last real touch
   uint8_t    replayIdx;                  // next history index to replay
   uint16_t   replayWait;                 // countdown frames until next ghost event
+  uint8_t    agcPeak;                    // AGC: running peak for volume normalization
 };
 
 /*
@@ -352,7 +353,7 @@ uint16_t mode_touch_ripple(void) {
 
   if (!SEGENV.allocateData(sizeof(TouchRippleData))) return FRAMETIME;
   TouchRippleData *data = reinterpret_cast<TouchRippleData*>(SEGENV.data);
-  if (SEGENV.call == 0) memset(data, 0, sizeof(TouchRippleData));
+  if (SEGENV.call == 0) { memset(data, 0, sizeof(TouchRippleData)); data->agcPeak = 128; }
 
   // Fade background toward black; c2 controls trail length
   uint8_t fadeRate = map8(SEGMENT.custom2, 180, 250);
@@ -410,7 +411,7 @@ uint16_t mode_touch_ripple(void) {
     }
   }
 
-  // Audio-reactive wave spawning: c3 controls sensitivity and brightness of audio-driven waves
+  // Audio-reactive wave spawning: c3 controls sensitivity (sqrt curve so half = ~70% of max)
   uint8_t audioMix = SEGMENT.custom3;
   if (audioMix > 0) {
     um_data_t *um_data = nullptr;
@@ -420,11 +421,30 @@ uint16_t mode_touch_ripple(void) {
       float volF = *(float*)um_data->u_data[0];
       if (volF <= 2.0f) volF *= 255.0f;
       uint8_t vol = (uint8_t)constrain((int)volF, 0, 255);
+
+      // AGC: instant attack, slow exponential decay (~8s half-life at 30fps)
+      if (vol > data->agcPeak) {
+        data->agcPeak = vol;
+      } else {
+        data->agcPeak = max((uint8_t)1, (uint8_t)((uint16_t)data->agcPeak * 253 >> 8));
+      }
+      // Normalize volume relative to recent peak (0-255 = silent to loudest-seen)
+      uint8_t normVol = (data->agcPeak > 10) ?
+        (uint8_t)min(255u, (uint32_t)vol * 255u / data->agcPeak) : 0;
+
+      // sqrt curve: half slider (128) maps to ~181/255 effective mix
+      uint8_t curvedMix = sqrt16((uint16_t)audioMix * 255);
+
+      // Threshold: fraction of recent peak needed to spawn; lower slider = higher bar
+      uint8_t threshold = 255 - scale8(curvedMix, 200);
+
       if (SEGENV.aux0 > 0) {
         SEGENV.aux0--;
-      } else if (vol > (255 - scale8(audioMix, 200))) {
-        spawnTouchWave(data, random8(MPR121::MAX_SENSORS), SEGLEN, maxAge, map8(audioMix, 120, 220));
-        SEGENV.aux0 = map8(255 - audioMix, 3, 20);
+      } else if (normVol > threshold) {
+        // Brightness scales with amplitude: louder = brighter (80-220 range)
+        uint8_t audioBri = 80 + scale8(normVol, scale8(curvedMix, 140));
+        spawnTouchWave(data, random8(MPR121::MAX_SENSORS), SEGLEN, maxAge, audioBri);
+        SEGENV.aux0 = map8(255 - curvedMix, 3, 20);
       }
     }
   }
