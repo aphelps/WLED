@@ -277,18 +277,34 @@ static const char _data_FX_MODE_HMTL_SPARKLE[] PROGMEM = "HMTL Sparkle@Rate,Spar
  * c2        → trail length (low=short, high=long; default 200)
  */
 
-#define MAX_TOUCH_WAVES 8
+#define MAX_TOUCH_WAVES  8
+#define MAX_HISTORY      16
+#define IDLE_THRESHOLD   90    // frames (~3s at 30fps) before idle replay starts
+#define REPLAY_SCALE      4    // timeDelta units = this many frames
+#define REPLAY_PAUSE    150    // frames to pause between replay cycles
+
+struct TouchEvent {
+  uint8_t electrode;   // 0-11
+  uint8_t timeDelta;   // frames since previous touch / REPLAY_SCALE, capped to 255
+};
 
 struct TouchWave {
-  uint16_t origin;   // anchor pixel index
-  uint8_t  age;      // frames elapsed since spawn
-  uint8_t  maxAge;   // 0 = inactive
-  uint8_t  color;    // palette index
+  uint16_t origin;    // anchor pixel index
+  uint8_t  age;       // frames elapsed since spawn
+  uint8_t  maxAge;    // 0 = inactive
+  uint8_t  color;     // palette index
+  uint8_t  ghostBri;  // 255 = real touch; ~80 = ghost replay wave
 };
 
 struct TouchRippleData {
-  uint16_t   prevTouched;               // bitmask from last frame
+  uint16_t   prevTouched;                // bitmask from last frame
   TouchWave  waves[MAX_TOUCH_WAVES];
+  TouchEvent history[MAX_HISTORY];       // ring buffer of recent touch events
+  uint8_t    histHead;                   // next write position in ring
+  uint8_t    histCount;                  // valid entries (0..MAX_HISTORY)
+  uint16_t   idleFrames;                 // frames since last real touch
+  uint8_t    replayIdx;                  // next history index to replay
+  uint16_t   replayWait;                 // countdown frames until next ghost event
 };
 
 /*
@@ -305,6 +321,24 @@ struct TouchRippleData {
  * c1        → MPR121 poll rate (Hz)
  * c2        → background fade rate (low=short trail, high=long trail)
  */
+#ifdef USERMOD_MPR121
+static void spawnTouchWave(TouchRippleData *data, uint8_t e, uint16_t segLen, uint8_t maxAge, uint8_t ghostBri) {
+  int slot = -1;
+  uint8_t oldestAge = 0; int oldestSlot = 0;
+  for (int w = 0; w < MAX_TOUCH_WAVES; w++) {
+    if (data->waves[w].maxAge == 0) { slot = w; break; }
+    if (data->waves[w].age >= oldestAge) { oldestAge = data->waves[w].age; oldestSlot = w; }
+  }
+  if (slot < 0) slot = oldestSlot;
+  data->waves[slot] = {
+    (uint16_t)((uint32_t)e * segLen / MPR121::MAX_SENSORS),
+    0, maxAge,
+    (uint8_t)(e * (256 / MPR121::MAX_SENSORS)),
+    ghostBri
+  };
+}
+#endif
+
 uint16_t mode_touch_ripple(void) {
 #ifndef USERMOD_MPR121
   return FRAMETIME;
@@ -325,7 +359,7 @@ uint16_t mode_touch_ripple(void) {
   for (uint16_t i = 0; i < SEGLEN; i++)
     SEGMENT.setPixelColor(i, color_fade(SEGMENT.getPixelColor(i), fadeRate, false));
 
-  // Detect new touches (rising edges) and spawn waves
+  // Detect touched electrodes and rising edges
   uint16_t curTouched = 0;
   for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++)
     if (mpr->touched(e)) curTouched |= (1u << e);
@@ -334,32 +368,55 @@ uint16_t mode_touch_ripple(void) {
   data->prevTouched = curTouched;
 
   uint8_t maxAge = map8(255 - SEGMENT.speed, 50, 200);
-  uint16_t maxRadius = (uint16_t)SEGLEN;  // allow wave to fill full strip
+  uint16_t maxRadius = (uint16_t)SEGLEN;
 
+  // Record new touches to history ring buffer and spawn real waves
   for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++) {
     if (!(newTouches & (1u << e))) continue;
-    int slot = -1;
-    uint8_t oldestAge = 0; int oldestSlot = 0;
-    for (int w = 0; w < MAX_TOUCH_WAVES; w++) {
-      if (data->waves[w].maxAge == 0) { slot = w; break; }
-      if (data->waves[w].age >= oldestAge) { oldestAge = data->waves[w].age; oldestSlot = w; }
-    }
-    if (slot < 0) slot = oldestSlot;
-    data->waves[slot] = {
-      (uint16_t)((uint32_t)e * SEGLEN / MPR121::MAX_SENSORS),
-      0,
-      maxAge,
-      (uint8_t)(e * (256 / MPR121::MAX_SENSORS))
-    };
+    uint8_t delta = (uint8_t)min((uint32_t)255, (uint32_t)data->idleFrames / REPLAY_SCALE);
+    data->history[data->histHead] = {e, delta};
+    data->histHead = (data->histHead + 1) % MAX_HISTORY;
+    if (data->histCount < MAX_HISTORY) data->histCount++;
+    spawnTouchWave(data, e, SEGLEN, maxAge, 255);
   }
 
-  // Draw active waves: bright wavefront + comet tail filling toward origin
+  // Update idle counter; reset and cancel replay on any new real touch
+  if (newTouches) {
+    data->idleFrames = 0;
+    data->replayIdx = 0;
+    data->replayWait = 0;
+  } else {
+    if (data->idleFrames < 0xFFFF) data->idleFrames++;
+  }
+
+  // Idle ghost replay: replay stored touch history as dim echo waves, preserving rhythm
+  if (data->idleFrames > IDLE_THRESHOLD && data->histCount > 0) {
+    if (data->replayWait > 0) {
+      data->replayWait--;
+    } else {
+      uint8_t oldest = (data->histHead + MAX_HISTORY - data->histCount) % MAX_HISTORY;
+      uint8_t idx = (oldest + data->replayIdx) % MAX_HISTORY;
+      spawnTouchWave(data, data->history[idx].electrode, SEGLEN, maxAge, 80);
+
+      uint8_t nextIdx = (data->replayIdx + 1) % data->histCount;
+      if (nextIdx == 0) {
+        data->replayWait = REPLAY_PAUSE;
+      } else {
+        uint8_t nextHistIdx = (oldest + nextIdx) % MAX_HISTORY;
+        uint16_t wait = (uint16_t)data->history[nextHistIdx].timeDelta * REPLAY_SCALE;
+        data->replayWait = (wait > 0) ? wait : 1;
+      }
+      data->replayIdx = nextIdx;
+    }
+  }
+
+  // Draw active waves: bright wavefront spike + comet tail; ghost waves dimmed via ghostBri
   for (int w = 0; w < MAX_TOUCH_WAVES; w++) {
     TouchWave &wave = data->waves[w];
     if (wave.maxAge == 0) continue;
 
     uint8_t frac = map(wave.age, 0, wave.maxAge, 0, 255);
-    uint8_t frontBri = scale8(255 - frac, SEGMENT.intensity);
+    uint8_t frontBri = scale8(scale8(255 - frac, SEGMENT.intensity), wave.ghostBri);
     uint32_t col = SEGMENT.color_from_palette(wave.color, false, false, 255);
     uint16_t radius = (uint32_t)wave.age * maxRadius / wave.maxAge;
 
@@ -369,12 +426,9 @@ uint16_t mode_touch_ripple(void) {
 
       uint8_t pBri;
       if (radius <= 1 || dist + 1 >= radius) {
-        // Wavefront spike: 3 pixels centered at radius from origin
         uint16_t frontDist = (dist >= radius) ? (dist - radius) : (radius - dist);
         pBri = (frontDist == 0) ? frontBri : scale8(frontBri, 150);
       } else {
-        // Comet tail: dims from wavefront back toward origin
-        // dist=0 (origin) = dim, dist near radius = ~half brightness
         pBri = scale8(scale8(frontBri, 100), (uint8_t)map(dist, 0, radius, 60, 200));
       }
       SEGMENT.blendPixelColor(p, col, pBri);
@@ -385,7 +439,7 @@ uint16_t mode_touch_ripple(void) {
   }
 
   // Held-electrode pulse: beatsin that makes the anchor glow rhythmically
-  uint8_t beat = beatsin8(30, 80, 220);  // 30 bpm, brightness range 80–220
+  uint8_t beat = beatsin8(30, 80, 220);
   for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++) {
     if (!(curTouched & (1u << e))) continue;
     uint16_t anchor = (uint32_t)e * SEGLEN / MPR121::MAX_SENSORS;
