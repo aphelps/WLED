@@ -433,8 +433,11 @@ uint16_t mode_touch_ripple(void) {
       uint8_t normVol = (data->agcPeak > 30) ?
         (uint8_t)min(255u, (uint32_t)vol * 255u / data->agcPeak) : 0;
 
-      // sqrt curve: half slider (128) maps to ~181/255 effective mix
-      uint8_t curvedMix = sqrt16((uint16_t)audioMix * 255);
+      // Piecewise curve: lower half (0-128) sqrt-compressed so 128 = "good" zone;
+      // upper half (128-255) linear to preserve full control range.
+      uint8_t curvedMix = (audioMix <= 128)
+        ? (uint8_t)sqrt16((uint16_t)audioMix * 100u)
+        : (uint8_t)(113u + (uint16_t)(audioMix - 128u) * 142u / 127u);
 
       // Threshold: fraction of recent peak needed to spawn; lower slider = higher bar
       uint8_t threshold = 255 - scale8(curvedMix, 165);
