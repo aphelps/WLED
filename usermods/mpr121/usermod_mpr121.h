@@ -119,7 +119,11 @@ class UsermodMPR121 : public Usermod {
   uint8_t    i2cAddress    = 0x5A;
   uint8_t    touchThresh   = 0x0A;
   uint8_t    releaseThresh = 0x0F;
+#ifndef MPR121_IRQ_PIN
   int8_t     irqPin        = -1;
+#else
+  int8_t     irqPin        = MPR121_IRQ_PIN;
+#endif
   uint8_t    updateHz      = 20;  // poll rate 1–100 Hz
 
   MPR121    *mpr121        = nullptr;

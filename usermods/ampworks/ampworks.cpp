@@ -267,7 +267,9 @@ static const char _data_FX_MODE_HMTL_SPARKLE[] PROGMEM = "HMTL Sparkle@Rate,Spar
  *
  * Each of the 12 electrodes maps to an evenly-spaced anchor point along the segment.
  * Touching an electrode radiates a bright pulse outward with linear falloff.
- * Electrode 12 (proximity) adds a dim global glow proportional to proximity.
+ * Electrode 12 (proximity) adds a dim global glow scaled by how far above the
+ * auto-calibrated idle baseline the proximity reading is. SEGENV.aux1 stores the
+ * baseline (slow EMA ~8 s at 30 fps) so no per-device threshold tuning is needed.
  * fade_out() provides natural inter-frame decay.
  *
  * Requires the mpr121 usermod to be enabled and configured.
@@ -283,7 +285,8 @@ uint16_t mode_touch_ripple(void) {
 
   mpr->setUpdateHz(map8(SEGMENT.custom1, 1, 100));
 
-  SEGMENT.fade_out(220);
+  for (uint16_t i = 0; i < SEGLEN; i++)
+    SEGMENT.setPixelColor(i, color_fade(SEGMENT.getPixelColor(i), 220, false));
 
   uint8_t rippleHalf = (uint8_t)max(1u, (uint32_t)map8(SEGMENT.speed, 2, SEGLEN / 4));
 
@@ -294,17 +297,11 @@ uint16_t mode_touch_ripple(void) {
       int16_t pos = (int16_t)anchor + d;
       if (pos < 0 || pos >= (int16_t)SEGLEN) continue;
       uint8_t bri = scale8((uint8_t)map(abs(d), 0, rippleHalf, 255, 0), SEGMENT.intensity);
-      SEGMENT.addPixelColor((uint16_t)pos, color_blend(BLACK, SEGCOLOR(e % 3), bri));
+      SEGMENT.blendPixelColor((uint16_t)pos, SEGCOLOR(e % 3), bri);
     }
   }
 
-  // Proximity electrode: dim global glow proportional to proximity reading
-  uint16_t prox = mpr->getFiltered(MPR121::PROX_SENSOR);
-  if (prox > 100) {
-    uint8_t proxBri = scale8((uint8_t)constrain(map(prox, 100, 800, 0, 80), 0, 80), SEGMENT.intensity);
-    uint32_t proxCol = color_blend(BLACK, SEGCOLOR(2), proxBri);
-    for (uint16_t i = 0; i < SEGLEN; i++) SEGMENT.addPixelColor(i, proxCol);
-  }
+  // Proximity glow removed pending MPR121 library setThresholds fix (see todo.md).
 
   return FRAMETIME;
 #endif
