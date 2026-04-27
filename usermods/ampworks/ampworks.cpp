@@ -265,15 +265,32 @@ static const char _data_FX_MODE_HMTL_SPARKLE[] PROGMEM = "HMTL Sparkle@Rate,Spar
 /*
  * Touch Ripple: reacts to MPR121 capacitive touch sensor data (USERMOD_ID_MPR121).
  *
- * Each of the 12 electrodes maps to an evenly-spaced anchor point along the segment.
- * Touching an electrode radiates a bright pulse outward with linear falloff.
- * Electrode 12 (proximity) adds a dim global glow scaled by how far above the
- * auto-calibrated idle baseline the proximity reading is. SEGENV.aux1 stores the
- * baseline (slow EMA ~8 s at 30 fps) so no per-device threshold tuning is needed.
- * fade_out() provides natural inter-frame decay.
+ * Each of the 12 electrodes maps to an evenly-spaced anchor along the segment.
+ * A new touch spawns an expanding wave: two wavefronts radiate outward in opposite
+ * directions from the anchor, fading as they travel. Up to 8 waves coexist.
+ * The touched anchor stays lit while held. Background fades toward black each frame.
+ * Each electrode gets a distinct hue spread across the active palette.
  *
- * Requires the mpr121 usermod to be enabled and configured.
+ * Speed     → wave travel speed (low=slow lingering waves, high=fast energetic)
+ * Intensity → peak wave brightness
+ * c1        → MPR121 poll rate (Hz)
+ * c2        → trail length (low=short, high=long; default 200)
  */
+
+#define MAX_TOUCH_WAVES 8
+
+struct TouchWave {
+  uint16_t origin;   // anchor pixel index
+  uint8_t  age;      // frames elapsed since spawn
+  uint8_t  maxAge;   // 0 = inactive
+  uint8_t  color;    // palette index
+};
+
+struct TouchRippleData {
+  uint16_t   prevTouched;               // bitmask from last frame
+  TouchWave  waves[MAX_TOUCH_WAVES];
+};
+
 uint16_t mode_touch_ripple(void) {
 #ifndef USERMOD_MPR121
   return FRAMETIME;
@@ -285,29 +302,93 @@ uint16_t mode_touch_ripple(void) {
 
   mpr->setUpdateHz(map8(SEGMENT.custom1, 1, 100));
 
-  for (uint16_t i = 0; i < SEGLEN; i++)
-    SEGMENT.setPixelColor(i, color_fade(SEGMENT.getPixelColor(i), 220, false));
+  if (!SEGENV.allocateData(sizeof(TouchRippleData))) return FRAMETIME;
+  TouchRippleData *data = reinterpret_cast<TouchRippleData*>(SEGENV.data);
 
-  uint8_t rippleHalf = (uint8_t)max(1u, (uint32_t)map8(SEGMENT.speed, 2, SEGLEN / 4));
+  if (SEGENV.call == 0) memset(data, 0, sizeof(TouchRippleData));
+
+  // Fade all pixels toward black each frame; c2 controls trail length
+  uint8_t fadeRate = map8(SEGMENT.custom2, 180, 250);
+  for (uint16_t i = 0; i < SEGLEN; i++)
+    SEGMENT.setPixelColor(i, color_fade(SEGMENT.getPixelColor(i), fadeRate, false));
+
+  // Detect new touches (rising edges) and spawn waves
+  uint16_t curTouched = 0;
+  for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++)
+    if (mpr->touched(e)) curTouched |= (1u << e);
+
+  uint16_t newTouches = curTouched & ~data->prevTouched;
+  data->prevTouched = curTouched;
+
+  // Wave lifetime: speed=high → short fast waves; speed=low → long slow waves
+  uint8_t maxAge = map8(255 - SEGMENT.speed, 20, 80);
 
   for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++) {
-    if (!mpr->touched(e)) continue;
-    uint16_t anchor = (uint32_t)e * SEGLEN / MPR121::MAX_SENSORS;
-    for (int16_t d = -(int16_t)rippleHalf; d <= (int16_t)rippleHalf; d++) {
-      int16_t pos = (int16_t)anchor + d;
-      if (pos < 0 || pos >= (int16_t)SEGLEN) continue;
-      uint8_t bri = scale8((uint8_t)map(abs(d), 0, rippleHalf, 255, 0), SEGMENT.intensity);
-      SEGMENT.blendPixelColor((uint16_t)pos, SEGCOLOR(e % 3), bri);
+    if (!(newTouches & (1u << e))) continue;
+
+    // Find a free slot, or evict the oldest active wave
+    int slot = -1;
+    uint8_t oldestAge = 0; int oldestSlot = 0;
+    for (int w = 0; w < MAX_TOUCH_WAVES; w++) {
+      if (data->waves[w].maxAge == 0) { slot = w; break; }
+      if (data->waves[w].age >= oldestAge) { oldestAge = data->waves[w].age; oldestSlot = w; }
     }
+    if (slot < 0) slot = oldestSlot;
+
+    data->waves[slot] = {
+      (uint16_t)((uint32_t)e * SEGLEN / MPR121::MAX_SENSORS),  // origin
+      0,                                                         // age
+      maxAge,                                                    // maxAge
+      (uint8_t)(e * (256 / MPR121::MAX_SENSORS))                // color: spread palette
+    };
   }
 
-  // Proximity glow removed pending MPR121 library setThresholds fix (see todo.md).
+  // Draw and advance all active waves
+  uint16_t maxRadius = max(1u, (uint32_t)SEGLEN / 2 + 1);
+  for (int w = 0; w < MAX_TOUCH_WAVES; w++) {
+    TouchWave &wave = data->waves[w];
+    if (wave.maxAge == 0) continue;
+
+    // Brightness falls from Intensity → 0 as age → maxAge
+    uint8_t frac = map(wave.age, 0, wave.maxAge, 0, 255);
+    uint8_t bri  = scale8(255 - frac, SEGMENT.intensity);
+
+    uint32_t col = SEGMENT.color_from_palette(wave.color, false, false, 255);
+    uint16_t radius = (uint32_t)wave.age * maxRadius / wave.maxAge;
+
+    // Paint two wavefronts (left and right), each 3 pixels wide with taper
+    int16_t centers[2] = {
+      (int16_t)wave.origin - (int16_t)radius,
+      (int16_t)wave.origin + (int16_t)radius
+    };
+    // Skip duplicate center pixel on the very first frame (radius==0)
+    uint8_t numFronts = (radius == 0) ? 1 : 2;
+    for (uint8_t f = 0; f < numFronts; f++) {
+      for (int8_t d = -1; d <= 1; d++) {
+        int16_t pos = centers[f] + d;
+        if (pos < 0 || pos >= (int16_t)SEGLEN) continue;
+        uint8_t taperedBri = (d == 0) ? bri : scale8(bri, 140);
+        SEGMENT.blendPixelColor((uint16_t)pos, col, taperedBri);
+      }
+    }
+
+    wave.age++;
+    if (wave.age >= wave.maxAge) wave.maxAge = 0;  // expire
+  }
+
+  // Keep anchor pixel lit while electrode is held
+  for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++) {
+    if (!(curTouched & (1u << e))) continue;
+    uint16_t anchor = (uint32_t)e * SEGLEN / MPR121::MAX_SENSORS;
+    uint32_t col = SEGMENT.color_from_palette(e * (256 / MPR121::MAX_SENSORS), false, false, 255);
+    SEGMENT.blendPixelColor(anchor, col, SEGMENT.intensity >> 1);
+  }
 
   return FRAMETIME;
 #endif
 }
 static const char _data_FX_MODE_TOUCH_RIPPLE[] PROGMEM =
-  "Touch Ripple@Speed,Intensity,Hz;!,!,!;!;01;c1=50";
+  "Touch Ripple@Speed,Intensity,Hz,Trail;!;!;01;sx=128,ix=220,c1=50,c2=200";
 
 
 // add more strings here to reduce flash memory usage
