@@ -333,7 +333,7 @@ uint16_t mode_touch_ripple(void) {
   uint16_t newTouches = curTouched & ~data->prevTouched;
   data->prevTouched = curTouched;
 
-  uint8_t maxAge = map8(255 - SEGMENT.speed, 20, 80);
+  uint8_t maxAge = map8(255 - SEGMENT.speed, 50, 200);
   uint16_t maxRadius = (uint16_t)SEGLEN;  // allow wave to fill full strip
 
   for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++) {
@@ -403,7 +403,7 @@ uint16_t mode_touch_ripple(void) {
 #endif
 }
 static const char _data_FX_MODE_TOUCH_RIPPLE[] PROGMEM =
-  "Touch Pond@Speed,Intensity,Hz,Trail;!;!;01;sx=128,ix=220,c1=50,c2=200";
+  "Touch Pond@Speed,Intensity,Hz,Trail;!;!;01;sx=40,ix=220,c1=50,c2=200";
 
 
 // add more strings here to reduce flash memory usage
