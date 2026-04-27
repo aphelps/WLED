@@ -291,6 +291,20 @@ struct TouchRippleData {
   TouchWave  waves[MAX_TOUCH_WAVES];
 };
 
+/*
+ * Touch Pond: each new touch spawns an expanding comet wave.
+ *
+ * Touch onset → two wavefronts radiate outward from the electrode anchor.
+ * The wavefront is a bright 3-pixel spike; behind it, a "comet tail" fills
+ * the interior of the expanding disc at reduced brightness. Up to 8 waves
+ * coexist, each with a distinct palette hue. While held, the anchor pixel
+ * pulses with a slow beat. Background fades to black each frame.
+ *
+ * Speed     → wave lifetime (low=slow lingering, high=fast energetic)
+ * Intensity → peak wave brightness
+ * c1        → MPR121 poll rate (Hz)
+ * c2        → background fade rate (low=short trail, high=long trail)
+ */
 uint16_t mode_touch_ripple(void) {
 #ifndef USERMOD_MPR121
   return FRAMETIME;
@@ -304,10 +318,9 @@ uint16_t mode_touch_ripple(void) {
 
   if (!SEGENV.allocateData(sizeof(TouchRippleData))) return FRAMETIME;
   TouchRippleData *data = reinterpret_cast<TouchRippleData*>(SEGENV.data);
-
   if (SEGENV.call == 0) memset(data, 0, sizeof(TouchRippleData));
 
-  // Fade all pixels toward black each frame; c2 controls trail length
+  // Fade background toward black; c2 controls trail length
   uint8_t fadeRate = map8(SEGMENT.custom2, 180, 250);
   for (uint16_t i = 0; i < SEGLEN; i++)
     SEGMENT.setPixelColor(i, color_fade(SEGMENT.getPixelColor(i), fadeRate, false));
@@ -320,13 +333,11 @@ uint16_t mode_touch_ripple(void) {
   uint16_t newTouches = curTouched & ~data->prevTouched;
   data->prevTouched = curTouched;
 
-  // Wave lifetime: speed=high → short fast waves; speed=low → long slow waves
   uint8_t maxAge = map8(255 - SEGMENT.speed, 20, 80);
+  uint16_t maxRadius = (uint16_t)SEGLEN;  // allow wave to fill full strip
 
   for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++) {
     if (!(newTouches & (1u << e))) continue;
-
-    // Find a free slot, or evict the oldest active wave
     int slot = -1;
     uint8_t oldestAge = 0; int oldestSlot = 0;
     for (int w = 0; w < MAX_TOUCH_WAVES; w++) {
@@ -334,61 +345,65 @@ uint16_t mode_touch_ripple(void) {
       if (data->waves[w].age >= oldestAge) { oldestAge = data->waves[w].age; oldestSlot = w; }
     }
     if (slot < 0) slot = oldestSlot;
-
     data->waves[slot] = {
-      (uint16_t)((uint32_t)e * SEGLEN / MPR121::MAX_SENSORS),  // origin
-      0,                                                         // age
-      maxAge,                                                    // maxAge
-      (uint8_t)(e * (256 / MPR121::MAX_SENSORS))                // color: spread palette
+      (uint16_t)((uint32_t)e * SEGLEN / MPR121::MAX_SENSORS),
+      0,
+      maxAge,
+      (uint8_t)(e * (256 / MPR121::MAX_SENSORS))
     };
   }
 
-  // Draw and advance all active waves
-  uint16_t maxRadius = max(1u, (uint32_t)SEGLEN / 2 + 1);
+  // Draw active waves: bright wavefront + comet tail filling toward origin
   for (int w = 0; w < MAX_TOUCH_WAVES; w++) {
     TouchWave &wave = data->waves[w];
     if (wave.maxAge == 0) continue;
 
-    // Brightness falls from Intensity → 0 as age → maxAge
     uint8_t frac = map(wave.age, 0, wave.maxAge, 0, 255);
-    uint8_t bri  = scale8(255 - frac, SEGMENT.intensity);
-
+    uint8_t frontBri = scale8(255 - frac, SEGMENT.intensity);
     uint32_t col = SEGMENT.color_from_palette(wave.color, false, false, 255);
     uint16_t radius = (uint32_t)wave.age * maxRadius / wave.maxAge;
 
-    // Paint two wavefronts (left and right), each 3 pixels wide with taper
-    int16_t centers[2] = {
-      (int16_t)wave.origin - (int16_t)radius,
-      (int16_t)wave.origin + (int16_t)radius
-    };
-    // Skip duplicate center pixel on the very first frame (radius==0)
-    uint8_t numFronts = (radius == 0) ? 1 : 2;
-    for (uint8_t f = 0; f < numFronts; f++) {
-      for (int8_t d = -1; d <= 1; d++) {
-        int16_t pos = centers[f] + d;
-        if (pos < 0 || pos >= (int16_t)SEGLEN) continue;
-        uint8_t taperedBri = (d == 0) ? bri : scale8(bri, 140);
-        SEGMENT.blendPixelColor((uint16_t)pos, col, taperedBri);
+    for (uint16_t p = 0; p < SEGLEN; p++) {
+      uint16_t dist = (p >= wave.origin) ? (p - wave.origin) : (wave.origin - p);
+      if (dist > radius + 1) continue;
+
+      uint8_t pBri;
+      if (radius <= 1 || dist + 1 >= radius) {
+        // Wavefront spike: 3 pixels centered at radius from origin
+        uint16_t frontDist = (dist >= radius) ? (dist - radius) : (radius - dist);
+        pBri = (frontDist == 0) ? frontBri : scale8(frontBri, 150);
+      } else {
+        // Comet tail: dims from wavefront back toward origin
+        // dist=0 (origin) = dim, dist near radius = ~half brightness
+        pBri = scale8(scale8(frontBri, 100), (uint8_t)map(dist, 0, radius, 60, 200));
       }
+      SEGMENT.blendPixelColor(p, col, pBri);
     }
 
     wave.age++;
-    if (wave.age >= wave.maxAge) wave.maxAge = 0;  // expire
+    if (wave.age >= wave.maxAge) wave.maxAge = 0;
   }
 
-  // Keep anchor pixel lit while electrode is held
+  // Held-electrode pulse: beatsin that makes the anchor glow rhythmically
+  uint8_t beat = beatsin8(30, 80, 220);  // 30 bpm, brightness range 80–220
   for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++) {
     if (!(curTouched & (1u << e))) continue;
     uint16_t anchor = (uint32_t)e * SEGLEN / MPR121::MAX_SENSORS;
     uint32_t col = SEGMENT.color_from_palette(e * (256 / MPR121::MAX_SENSORS), false, false, 255);
-    SEGMENT.blendPixelColor(anchor, col, SEGMENT.intensity >> 1);
+    uint8_t anchorBri = scale8(beat, SEGMENT.intensity >> 1);
+    for (int8_t d = -1; d <= 1; d++) {
+      int16_t pos = (int16_t)anchor + d;
+      if (pos < 0 || pos >= (int16_t)SEGLEN) continue;
+      uint8_t taperedBri = (d == 0) ? anchorBri : scale8(anchorBri, 160);
+      SEGMENT.blendPixelColor((uint16_t)pos, col, taperedBri);
+    }
   }
 
   return FRAMETIME;
 #endif
 }
 static const char _data_FX_MODE_TOUCH_RIPPLE[] PROGMEM =
-  "Touch Ripple@Speed,Intensity,Hz,Trail;!;!;01;sx=128,ix=220,c1=50,c2=200";
+  "Touch Pond@Speed,Intensity,Hz,Trail;!;!;01;sx=128,ix=220,c1=50,c2=200";
 
 
 // add more strings here to reduce flash memory usage
