@@ -2,6 +2,9 @@
 #ifdef USERMOD_MPR121
   #include "../usermods/mpr121/usermod_mpr121.h"
 #endif
+#ifdef USERMOD_TOUCH_SYNC
+  #include "../usermods/ampworks/usermod_touch_sync.h"
+#endif
 
 /*
  * AMP's initial test mode
@@ -323,7 +326,12 @@ struct TouchRippleData {
  * c2        → background fade rate (low=short trail, high=long trail)
  */
 #ifdef USERMOD_MPR121
-static void spawnTouchWave(TouchRippleData *data, uint8_t e, uint16_t segLen, uint8_t maxAge, uint8_t ghostBri) {
+// Default palette hue for an electrode's wave (local/ghost/audio waves).
+static inline uint8_t touchWaveColor(uint8_t e) {
+  return (uint8_t)(e * (256 / MPR121::MAX_SENSORS));
+}
+
+static void spawnTouchWave(TouchRippleData *data, uint8_t e, uint16_t segLen, uint8_t maxAge, uint8_t ghostBri, uint8_t color) {
   int slot = -1;
   uint8_t oldestAge = 0; int oldestSlot = 0;
   for (int w = 0; w < MAX_TOUCH_WAVES; w++) {
@@ -334,7 +342,7 @@ static void spawnTouchWave(TouchRippleData *data, uint8_t e, uint16_t segLen, ui
   data->waves[slot] = {
     (uint16_t)((uint32_t)e * segLen / MPR121::MAX_SENSORS),
     0, maxAge,
-    (uint8_t)(e * (256 / MPR121::MAX_SENSORS)),
+    color,
     ghostBri
   };
 }
@@ -346,10 +354,12 @@ uint16_t mode_touch_ripple(void) {
 #else
   if (SEGLEN == 0) return FRAMETIME;
 
+  // mpr may report no physical sensor (display-only node): the touched() wrappers then
+  // return false, so local-touch logic is inert but remote/audio waves still render.
   UsermodMPR121 *mpr = (UsermodMPR121*) UsermodManager::lookup(USERMOD_ID_MPR121);
-  if (!mpr || !mpr->isSensorFound()) return FRAMETIME;
+  if (!mpr) return FRAMETIME;
 
-  mpr->setUpdateHz(map8(SEGMENT.custom1, 1, 100));
+  if (mpr->isSensorFound()) mpr->setUpdateHz(map8(SEGMENT.custom1, 1, 100));
 
   if (!SEGENV.allocateData(sizeof(TouchRippleData))) return FRAMETIME;
   TouchRippleData *data = reinterpret_cast<TouchRippleData*>(SEGENV.data);
@@ -378,8 +388,24 @@ uint16_t mode_touch_ripple(void) {
     data->history[data->histHead] = {e, delta};
     data->histHead = (data->histHead + 1) % MAX_HISTORY;
     if (data->histCount < MAX_HISTORY) data->histCount++;
-    spawnTouchWave(data, e, SEGLEN, maxAge, 255);
+    spawnTouchWave(data, e, SEGLEN, maxAge, 255, touchWaveColor(e));
   }
+
+  // Remote touches from other devices (touch-sync usermod): spawn a wave with a
+  // distinct hue (offset half the palette) so remote interaction is visibly different.
+  // M0 limitation: drains a single global queue — correct for one active Touch Pond segment.
+#ifdef USERMOD_TOUCH_SYNC
+  {
+    UsermodTouchSync *ts = (UsermodTouchSync*) UsermodManager::lookup(USERMOD_ID_TOUCH_SYNC);
+    if (ts) {
+      RemoteSensorEvent ev;
+      while (ts->popRemoteEvent(ev)) {
+        if (ev.sensorType == TS_SENSOR_TOUCH && ev.value && ev.channel < MPR121::MAX_SENSORS)
+          spawnTouchWave(data, ev.channel, SEGLEN, maxAge, 255, (uint8_t)(touchWaveColor(ev.channel) + 128));
+      }
+    }
+  }
+#endif
 
   // Update idle counter; reset and cancel replay on any new real touch
   if (newTouches) {
@@ -397,7 +423,7 @@ uint16_t mode_touch_ripple(void) {
     } else {
       uint8_t oldest = (data->histHead + MAX_HISTORY - data->histCount) % MAX_HISTORY;
       uint8_t idx = (oldest + data->replayIdx) % MAX_HISTORY;
-      spawnTouchWave(data, data->history[idx].electrode, SEGLEN, maxAge, 80);
+      spawnTouchWave(data, data->history[idx].electrode, SEGLEN, maxAge, 80, touchWaveColor(data->history[idx].electrode));
 
       uint8_t nextIdx = (data->replayIdx + 1) % data->histCount;
       if (nextIdx == 0) {
@@ -447,7 +473,8 @@ uint16_t mode_touch_ripple(void) {
       } else if (normVol > threshold) {
         // Brightness scales with amplitude: louder = brighter (80-220 range)
         uint8_t audioBri = 80 + scale8(normVol, scale8(curvedMix, 140));
-        spawnTouchWave(data, random8(MPR121::MAX_SENSORS), SEGLEN, maxAge, audioBri);
+        uint8_t audioE = random8(MPR121::MAX_SENSORS);
+        spawnTouchWave(data, audioE, SEGLEN, maxAge, audioBri, touchWaveColor(audioE));
         SEGENV.aux0 = map8(255 - curvedMix, 8, 40);
       }
     }

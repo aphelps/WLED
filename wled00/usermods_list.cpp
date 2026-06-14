@@ -163,6 +163,10 @@
   #include "../usermods/mpr121/usermod_mpr121.h"
 #endif
 
+#ifdef USERMOD_TOUCH_SYNC
+  #include "../usermods/ampworks/usermod_touch_sync.h"
+#endif
+
 #ifdef USERMOD_ANALOG_CLOCK
   #include "../usermods/Analog_Clock/Analog_Clock.h"
 #endif
@@ -402,6 +406,10 @@ void registerUsermods()
 
   #ifdef USERMOD_MPR121
   UsermodManager::add(new UsermodMPR121());
+  #endif
+
+  #ifdef USERMOD_TOUCH_SYNC
+  UsermodManager::add(new UsermodTouchSync());
   #endif
 
   #ifdef USERMOD_ANALOG_CLOCK
