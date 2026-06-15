@@ -2,8 +2,8 @@
 #ifdef USERMOD_MPR121
   #include "../usermods/mpr121/usermod_mpr121.h"
 #endif
-#ifdef USERMOD_TOUCH_SYNC
-  #include "../usermods/ampworks/usermod_touch_sync.h"
+#ifdef USERMOD_SENSOR_SYNC
+  #include "../usermods/ampworks/usermod_sensor_sync.h"
 #endif
 
 /*
@@ -391,16 +391,16 @@ uint16_t mode_touch_ripple(void) {
     spawnTouchWave(data, e, SEGLEN, maxAge, 255, touchWaveColor(e));
   }
 
-  // Remote touches from other devices (touch-sync usermod): spawn a wave with a
+  // Remote touches from other devices (sensor-sync usermod): spawn a wave with a
   // distinct hue (offset half the palette) so remote interaction is visibly different.
   // M0 limitation: drains a single global queue — correct for one active Touch Pond segment.
-#ifdef USERMOD_TOUCH_SYNC
+#ifdef USERMOD_SENSOR_SYNC
   {
-    UsermodTouchSync *ts = (UsermodTouchSync*) UsermodManager::lookup(USERMOD_ID_TOUCH_SYNC);
-    if (ts) {
+    UsermodSensorSync *ss = (UsermodSensorSync*) UsermodManager::lookup(USERMOD_ID_SENSOR_SYNC);
+    if (ss) {
       RemoteSensorEvent ev;
-      while (ts->popRemoteEvent(ev)) {
-        if (ev.sensorType == TS_SENSOR_TOUCH && ev.value && ev.channel < MPR121::MAX_SENSORS)
+      while (ss->popRemoteEvent(ev)) {
+        if (ev.sensorType == SS_SENSOR_TOUCH && ev.value && ev.channel < MPR121::MAX_SENSORS)
           spawnTouchWave(data, ev.channel, SEGLEN, maxAge, 255, (uint8_t)(touchWaveColor(ev.channel) + 128));
       }
     }
