@@ -3,9 +3,9 @@
   #include "../usermods/mpr121/usermod_mpr121.h"
 #endif
 
-// The largest single message must fit the receive buffer (oversized datagrams are flushed).
-static_assert(sizeof(SensorSyncHeader) + 255 * sizeof(SensorEdge) >= sizeof(SensorSyncHeader),
-              "edge batch size sanity");
+// RX_BUF_LEN reserves 64 bytes for sensor data after the header; the largest per-type data
+// struct must fit that allowance (oversized datagrams are flushed in receiveLoop()).
+static_assert(sizeof(SensorSnapshot) <= 64, "sensor data struct exceeds RX_BUF_LEN data allowance");
 
 const char UsermodSensorSync::_name[]    PROGMEM = "SensorSync";
 const char UsermodSensorSync::_enabled[] PROGMEM = "enabled";
@@ -93,14 +93,32 @@ void UsermodSensorSync::enqueue(uint8_t sensorType, uint8_t channel, uint8_t val
   else rxTail = (rxTail + 1) % RX_QUEUE_LEN;  // overwrite oldest
 }
 
-// Edges are derived at the producer, so the consumer just forwards each record to the queue.
+// Find (or allocate) the stored snapshot for a peer. Reuses a free slot; if all are in use
+// it evicts slot 0 (a re-added peer then resyncs from mask=0 — see dispatchMessage). Fine at
+// M0's handful of devices; revisit with a real last-seen LRU for the fleet milestone.
+UsermodSensorSync::PeerSnapshot *UsermodSensorSync::peerSlot(uint16_t dev) {
+  for (uint8_t i = 0; i < MAX_PEERS; i++)
+    if (peers[i].used && peers[i].deviceId == dev) return &peers[i];
+  for (uint8_t i = 0; i < MAX_PEERS; i++)
+    if (!peers[i].used) { peers[i] = {dev, 0, true}; return &peers[i]; }
+  peers[0] = {dev, 0, true};
+  return &peers[0];
+}
+
+// Consumer-side edge derivation: diff the incoming snapshot against the peer's last snapshot
+// and enqueue one event per changed channel. First message from a peer (mask 0) resyncs by
+// emitting a press for every already-active channel.
 void UsermodSensorSync::dispatchMessage(const SensorSyncHeader &h, const uint8_t *data, int dataLen) {
-  int avail = dataLen / (int)sizeof(SensorEdge);
-  int n = (h.count < avail) ? h.count : avail;
-  for (int i = 0; i < n; i++) {
-    SensorEdge e;
-    memcpy(&e, data + i * sizeof(SensorEdge), sizeof(e));
-    enqueue(h.sensorType, e.channel, e.value, h.deviceId, h.timestamp);
+  if (h.sensorType == SS_SENSOR_TOUCH && dataLen >= (int)sizeof(SensorSnapshot)) {
+    SensorSnapshot snap;
+    memcpy(&snap, data, sizeof(snap));
+    PeerSnapshot *p = peerSlot(h.deviceId);
+    uint16_t changed = snap.mask ^ p->mask;
+    for (uint8_t e = 0; e < 16; e++) {
+      if (!(changed & (1u << e))) continue;
+      enqueue(SS_SENSOR_TOUCH, e, (snap.mask & (1u << e)) ? 1 : 0, h.deviceId, h.timestamp);
+    }
+    p->mask = snap.mask;
   }
 }
 
@@ -114,9 +132,10 @@ void UsermodSensorSync::receiveLoop() {
       if (rd >= (int)sizeof(h)) {
         memcpy(&h, buf, sizeof(h));
         if (h.magic[0] == 'A' && h.magic[1] == 'M' && h.magic[2] == 'P' && h.magic[3] == 'S' &&
-            h.version == SENSOR_SYNC_VERSION && h.msgType == SENSOR_SYNC_MSG_EDGES &&
-            h.deviceId != deviceId) {
-          dispatchMessage(h, buf + sizeof(h), rd - (int)sizeof(h));
+            h.version == SENSOR_SYNC_VERSION && h.msgType == SENSOR_SYNC_MSG_SNAPSHOT &&
+            h.deviceId != deviceId &&
+            (int)sizeof(h) + (int)h.dataLen <= rd) {
+          dispatchMessage(h, buf + sizeof(h), h.dataLen);
         }
       }
     } else {
@@ -126,51 +145,39 @@ void UsermodSensorSync::receiveLoop() {
   }
 }
 
-void UsermodSensorSync::sendEdges(uint8_t sensorType, const SensorEdge *edges, uint8_t n) {
-  if (n == 0) return;
-  uint8_t buf[RX_BUF_LEN];
-  if (sizeof(SensorSyncHeader) + (size_t)n * sizeof(SensorEdge) > sizeof(buf)) return;
+bool UsermodSensorSync::sendSnapshot(uint8_t sensorType, uint16_t mask) {
+  uint8_t buf[sizeof(SensorSyncHeader) + sizeof(SensorSnapshot)];
   SensorSyncHeader h;
   h.magic[0] = 'A'; h.magic[1] = 'M'; h.magic[2] = 'P'; h.magic[3] = 'S';
   h.version    = SENSOR_SYNC_VERSION;
-  h.msgType    = SENSOR_SYNC_MSG_EDGES;
+  h.msgType    = SENSOR_SYNC_MSG_SNAPSHOT;
   h.sensorType = sensorType;
-  h.count      = n;
+  h.dataLen    = sizeof(SensorSnapshot);
   h.deviceId   = deviceId;
   h.seq        = txSeq++;
   h.timestamp  = millis() + strip.timebase;
+  SensorSnapshot snap; snap.mask = mask;
   memcpy(buf, &h, sizeof(h));
-  memcpy(buf + sizeof(h), edges, (size_t)n * sizeof(SensorEdge));
+  memcpy(buf + sizeof(h), &snap, sizeof(snap));
 
-  if (udp.beginPacket(IPAddress(255, 255, 255, 255), port)) {
-    udp.write(buf, sizeof(h) + (size_t)n * sizeof(SensorEdge));
-    udp.endPacket();
-    txCount++;
-  }
+  if (!udp.beginPacket(IPAddress(255, 255, 255, 255), port)) return false;
+  udp.write(buf, sizeof(buf));
+  if (!udp.endPacket()) return false;
+  txCount++;
+  return true;
 }
 
 void UsermodSensorSync::broadcastLocalState() {
 #ifdef USERMOD_MPR121
   UsermodMPR121 *mpr = (UsermodMPR121*) UsermodManager::lookup(USERMOD_ID_MPR121);
-  if (!mpr || !mpr->isSensorFound()) { prevLocalTouched = 0; return; }
+  if (!mpr || !mpr->isSensorFound()) { prevLocalMask = 0; return; }
 
   uint16_t cur = 0;
   for (uint8_t e = 0; e < MPR121::TOTAL_SENSORS; e++)
     if (mpr->touched(e)) cur |= (1u << e);
 
-  uint16_t changed = cur ^ prevLocalTouched;
-  if (!changed) return;
-
-  // Producer derives edges once and sends all changed channels in one message.
-  SensorEdge edges[MPR121::TOTAL_SENSORS];
-  uint8_t n = 0;
-  for (uint8_t e = 0; e < MPR121::TOTAL_SENSORS; e++) {
-    if (!(changed & (1u << e))) continue;
-    edges[n].channel = e;
-    edges[n].value   = (cur & (1u << e)) ? 1 : 0;
-    n++;
-  }
-  sendEdges(SS_SENSOR_TOUCH, edges, n);
-  prevLocalTouched = cur;
+  if (cur == prevLocalMask) return;
+  // Only advance prevLocalMask on a successful send, so a failed send retries next loop.
+  if (sendSnapshot(SS_SENSOR_TOUCH, cur)) prevLocalMask = cur;
 #endif
 }
