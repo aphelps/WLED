@@ -36,21 +36,23 @@
   #define SENSOR_SYNC_PORT 21330
 #endif
 
-#define SENSOR_SYNC_VERSION      4   // wire protocol version (snapshot + consumer-side edges)
+#define SENSOR_SYNC_VERSION      5   // wire protocol version (32-bit deviceId)
 #define SENSOR_SYNC_MSG_SNAPSHOT 0   // msgType: a full sensor-state snapshot
 
 // Sensor type tags (extend as new producers are added).
 #define SS_SENSOR_TOUCH   0   // MPR121 channels; SensorSnapshot.mask bit e = channel e active
 
-// Generic header, common to every sensor type. 16 bytes, naturally 4-byte aligned.
+// Generic header, common to every sensor type. 20 bytes, naturally 4-byte aligned
+// (4-byte magic, deviceId, and timestamp all land on 4-byte boundaries).
 struct __attribute__((packed)) SensorSyncHeader {
   char     magic[4];   // {'A','M','P','S'} — AMPWorks sensor sync
   uint8_t  version;    // SENSOR_SYNC_VERSION
   uint8_t  msgType;    // SENSOR_SYNC_MSG_*
   uint8_t  sensorType; // SS_SENSOR_* — selects the data struct that follows
   uint8_t  dataLen;    // number of sensor-data bytes following the header
-  uint16_t deviceId;   // origin device id
+  uint32_t deviceId;   // origin device id (32-bit hash of the full MAC; see deriveDeviceId)
   uint16_t seq;        // per-sender sequence number (future dedup/loss tracking)
+  uint16_t reserved;   // padding to keep timestamp 4-byte aligned; reserved for future use
   uint32_t timestamp;  // millis() + strip.timebase at origin
 };
 
@@ -64,7 +66,7 @@ struct RemoteSensorEvent {
   uint8_t  sensorType;
   uint8_t  channel;
   uint8_t  value;      // 1 = became active (press), 0 = became inactive (release)
-  uint16_t deviceId;
+  uint32_t deviceId;
   uint32_t timestamp;
 };
 
@@ -79,7 +81,7 @@ class UsermodSensorSync : public Usermod {
 
   // Consumer API: pop the oldest derived remote event; false when the queue is empty.
   bool popRemoteEvent(RemoteSensorEvent &out);
-  uint16_t getDeviceId() const;
+  uint32_t getDeviceId() const;
 
   uint16_t getId() override;
   void addToJsonInfo(JsonObject &root) override;
@@ -94,8 +96,8 @@ class UsermodSensorSync : public Usermod {
   bool     initDone   = false;
   bool     enabled    = true;
   uint16_t port       = SENSOR_SYNC_PORT;
-  uint16_t configId   = 0;       // 0 = auto-derive
-  uint16_t deviceId   = 0;
+  uint32_t configId   = 0;       // 0 = auto-derive
+  uint32_t deviceId   = 0;
 
   WiFiUDP  udp;
   bool     udpStarted = false;
@@ -107,12 +109,12 @@ class UsermodSensorSync : public Usermod {
   uint8_t  rxHead = 0, rxTail = 0, rxCount = 0;
 
   // Per-peer last snapshot, so the consumer can derive edges from full-state messages.
-  struct PeerSnapshot { uint16_t deviceId; uint16_t mask; bool used; };
+  struct PeerSnapshot { uint32_t deviceId; uint16_t mask; bool used; };
   PeerSnapshot peers[MAX_PEERS] = {};
 
-  static uint16_t deriveDeviceId();
-  void enqueue(uint8_t sensorType, uint8_t channel, uint8_t value, uint16_t dev, uint32_t ts);
-  PeerSnapshot *peerSlot(uint16_t dev);
+  static uint32_t deriveDeviceId();
+  void enqueue(uint8_t sensorType, uint8_t channel, uint8_t value, uint32_t dev, uint32_t ts);
+  PeerSnapshot *peerSlot(uint32_t dev);
   void dispatchMessage(const SensorSyncHeader &h, const uint8_t *data, int dataLen);
   void receiveLoop();
   bool sendSnapshot(uint8_t sensorType, uint16_t mask);

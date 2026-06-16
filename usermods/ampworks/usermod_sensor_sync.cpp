@@ -40,7 +40,7 @@ bool UsermodSensorSync::popRemoteEvent(RemoteSensorEvent &out) {
   return true;
 }
 
-uint16_t UsermodSensorSync::getDeviceId() const { return deviceId; }
+uint32_t UsermodSensorSync::getDeviceId() const { return deviceId; }
 
 uint16_t UsermodSensorSync::getId() { return USERMOD_ID_SENSOR_SYNC; }
 
@@ -73,15 +73,22 @@ bool UsermodSensorSync::readFromConfig(JsonObject &root) {
   return true;
 }
 
-uint16_t UsermodSensorSync::deriveDeviceId() {
+uint32_t UsermodSensorSync::deriveDeviceId() {
+  // 32-bit FNV-1a hash of the full 6-byte MAC: folds in all device-unique entropy (incl.
+  // mac[3], which a low-bytes scheme discards) so auto-IDs are effectively collision-free
+  // at fleet scale. Override deterministically via the `id` config field if desired.
   uint8_t mac[6] = {0};
   WiFi.macAddress(mac);
-  uint16_t id = ((uint16_t)mac[4] << 8) | mac[5];
-  return id ? id : 1;  // never 0 (0 means "auto")
+  uint32_t h = 2166136261u;          // FNV offset basis
+  for (uint8_t i = 0; i < 6; i++) {
+    h ^= mac[i];
+    h *= 16777619u;                  // FNV prime
+  }
+  return h ? h : 1;  // never 0 (0 means "auto")
 }
 
 void UsermodSensorSync::enqueue(uint8_t sensorType, uint8_t channel, uint8_t value,
-                                uint16_t dev, uint32_t ts) {
+                                uint32_t dev, uint32_t ts) {
   RemoteSensorEvent &slot = rxQueue[rxHead];
   slot.sensorType = sensorType;
   slot.channel    = channel;
@@ -96,7 +103,7 @@ void UsermodSensorSync::enqueue(uint8_t sensorType, uint8_t channel, uint8_t val
 // Find (or allocate) the stored snapshot for a peer. Reuses a free slot; if all are in use
 // it evicts slot 0 (a re-added peer then resyncs from mask=0 — see dispatchMessage). Fine at
 // M0's handful of devices; revisit with a real last-seen LRU for the fleet milestone.
-UsermodSensorSync::PeerSnapshot *UsermodSensorSync::peerSlot(uint16_t dev) {
+UsermodSensorSync::PeerSnapshot *UsermodSensorSync::peerSlot(uint32_t dev) {
   for (uint8_t i = 0; i < MAX_PEERS; i++)
     if (peers[i].used && peers[i].deviceId == dev) return &peers[i];
   for (uint8_t i = 0; i < MAX_PEERS; i++)
@@ -155,6 +162,7 @@ bool UsermodSensorSync::sendSnapshot(uint8_t sensorType, uint16_t mask) {
   h.dataLen    = sizeof(SensorSnapshot);
   h.deviceId   = deviceId;
   h.seq        = txSeq++;
+  h.reserved   = 0;
   h.timestamp  = millis() + strip.timebase;
   SensorSnapshot snap; snap.mask = mask;
   memcpy(buf, &h, sizeof(h));
