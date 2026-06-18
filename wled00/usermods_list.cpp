@@ -163,6 +163,11 @@
   #include "../usermods/mpr121/usermod_mpr121.h"
 #endif
 
+#ifdef USERMOD_SENSOR_SYNC
+  #include "../usermods/ampworks/usermod_sensor_sync.h"
+  #include "../usermods/ampworks/usermod_sensor_sync.cpp"
+#endif
+
 #ifdef USERMOD_ANALOG_CLOCK
   #include "../usermods/Analog_Clock/Analog_Clock.h"
 #endif
@@ -402,6 +407,10 @@ void registerUsermods()
 
   #ifdef USERMOD_MPR121
   UsermodManager::add(new UsermodMPR121());
+  #endif
+
+  #ifdef USERMOD_SENSOR_SYNC
+  UsermodManager::add(new UsermodSensorSync());
   #endif
 
   #ifdef USERMOD_ANALOG_CLOCK
