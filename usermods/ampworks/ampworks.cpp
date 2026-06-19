@@ -530,6 +530,158 @@ static const char _data_FX_MODE_TOUCH_RIPPLE[] PROGMEM =
   "Touch Pond@Speed,Intensity,Hz,Trail,Audio;!;!;01;sx=40,ix=220,c1=50,c2=200,c3=50";
 
 
+/*
+ * Touch Grid: 2D effect for square LED grids (matrix 8x8, touch-box 5x5).
+ *  - Outer ring (perimeter) is touch-reactive: each touch spawns a colored dot that chases
+ *    clockwise around the ring. Local touches (this device's MPR121) are bright; remote
+ *    touches (other devices, via the sensor-sync bus) are dimmer.
+ *  - Interior square runs a Fire2012-style fire (rising toward the top row).
+ *
+ * Requires a 2D matrix segment with W,H >= 3. Perimeter = 2W+2H-4 cells; interior = (W-2)x(H-2).
+ * Speed -> chase speed | Fire(ix) -> spark rate | Hz(c1) -> MPR121 poll | Cool(c2) -> fire cooling
+ * Tail(c3) -> chaser tail length | Palette -> chaser colors.
+ */
+#define TG_MAX_CHASERS 16
+
+struct TouchChaser {
+  float    pos;    // ring index (clockwise) [0, perim)
+  float    speed;  // ring units per frame
+  uint8_t  hue;    // palette index
+  uint8_t  bri;    // brightness scale (255 local / dimmer remote)
+  uint16_t life;   // frames remaining (0 = inactive)
+};
+
+struct GridFireData {
+  uint16_t    prevTouched;             // local MPR121 edge state
+  TouchChaser chasers[TG_MAX_CHASERS];
+  uint8_t     heat[];                  // (W-2)*(H-2) interior heat (flexible array)
+};
+
+// Clockwise ring index -> (x,y) on a W x H border. r in [0, 2W+2H-4).
+static void tgRingXY(int r, int W, int H, int &x, int &y) {
+  const int top = W, right = H - 1, bottom = W - 1;
+  if      (r < top)                  { x = r;                          y = 0; }
+  else if (r < top + right)          { x = W - 1;                      y = r - top + 1; }
+  else if (r < top + right + bottom) { x = W - 2 - (r - top - right);  y = H - 1; }
+  else                               { x = 0;                          y = H - 1 - (r - top - right - bottom); }
+}
+
+// FastLED-style heat -> fire color (black -> red -> yellow -> white).
+static uint32_t tgHeatColor(uint8_t heat) {
+  uint8_t t192 = scale8(heat, 191);
+  uint8_t ramp = (uint8_t)((t192 & 0x3F) << 2);
+  if      (t192 & 0x80) return RGBW32(255, 255, ramp, 0);
+  else if (t192 & 0x40) return RGBW32(255, ramp, 0, 0);
+  else                  return RGBW32(ramp, 0, 0, 0);
+}
+
+static void tgSpawnChaser(GridFireData *d, uint8_t channel, uint8_t nch, int perim, uint8_t bri, uint8_t speedSlider) {
+  int slot = -1; uint16_t oldest = 0xFFFF; int oslot = 0;
+  for (int i = 0; i < TG_MAX_CHASERS; i++) {
+    if (d->chasers[i].life == 0) { slot = i; break; }
+    if (d->chasers[i].life <= oldest) { oldest = d->chasers[i].life; oslot = i; }
+  }
+  if (slot < 0) slot = oslot;
+  if (nch == 0) nch = 1;
+  TouchChaser &c = d->chasers[slot];
+  c.pos   = (float)((uint32_t)channel * perim / nch);     // start near the touched electrode
+  c.speed = 0.15f + (float)speedSlider / 255.0f * 0.85f;  // 0.15 .. 1.0 ring units / frame
+  c.hue   = (uint8_t)(channel * (256 / nch));
+  c.bri   = bri;
+  c.life  = 1200;
+}
+
+uint16_t mode_touch_grid(void) {
+  if (!SEGMENT.is2D()) return FRAMETIME;
+  const int W = SEGMENT.virtualWidth();
+  const int H = SEGMENT.virtualHeight();
+  if (W < 3 || H < 3) return FRAMETIME;
+
+  const int perim = 2 * W + 2 * H - 4;
+  const int iW = W - 2, iH = H - 2;        // interior dims
+  const int heatBytes = iW * iH;
+
+  if (!SEGENV.allocateData(sizeof(GridFireData) + heatBytes)) return FRAMETIME;
+  GridFireData *d = reinterpret_cast<GridFireData*>(SEGENV.data);
+  if (SEGENV.call == 0) memset(d, 0, sizeof(GridFireData) + heatBytes);
+
+  // --- collect touches -> spawn chasers (local bright, remote dim) ---
+#ifdef USERMOD_MPR121
+  UsermodMPR121 *mpr = (UsermodMPR121*) UsermodManager::lookup(USERMOD_ID_MPR121);
+  if (mpr) {
+    if (mpr->isSensorFound()) mpr->setUpdateHz(map8(SEGMENT.custom1, 1, 100));
+    uint16_t cur = 0;
+    for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++) if (mpr->touched(e)) cur |= (1u << e);
+    uint16_t newTouch = cur & ~d->prevTouched;
+    d->prevTouched = cur;
+    for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++)
+      if (newTouch & (1u << e)) tgSpawnChaser(d, e, MPR121::MAX_SENSORS, perim, 255, SEGMENT.speed);
+  }
+  #ifdef USERMOD_SENSOR_SYNC
+  UsermodSensorSync *ss = (UsermodSensorSync*) UsermodManager::lookup(USERMOD_ID_SENSOR_SYNC);
+  if (ss) {
+    RemoteSensorEvent ev;
+    while (ss->popRemoteEvent(ev))
+      if (ev.sensorType == SS_SENSOR_TOUCH && ev.value)
+        tgSpawnChaser(d, ev.channel, MPR121::MAX_SENSORS, perim, 90, SEGMENT.speed);
+  }
+  #endif
+#endif
+
+  // --- interior fire (rising toward y=0; flame base = row y=iH-1) ---
+  if (iW > 0 && iH > 0) {
+    uint8_t coolBase = map8(SEGMENT.custom2, 5, 40);
+    uint8_t sparking = map8(SEGMENT.intensity, 40, 200);
+    for (int x = 0; x < iW; x++) {
+      for (int y = 0; y < iH; y++) {
+        int idx = y * iW + x;
+        uint8_t cool = random8(coolBase + 2);
+        d->heat[idx] = (d->heat[idx] > cool) ? (uint8_t)(d->heat[idx] - cool) : 0;
+      }
+      for (int y = 0; y < iH - 1; y++) {
+        int below1 = d->heat[(y + 1) * iW + x];
+        int below2 = d->heat[((y < iH - 2) ? (y + 2) : (y + 1)) * iW + x];
+        d->heat[y * iW + x] = (uint8_t)((below1 + below2 + below2) / 3);
+      }
+      if (random8() < sparking) {
+        int idx = (iH - 1) * iW + x;
+        d->heat[idx] = qadd8(d->heat[idx], random8(160, 255));
+      }
+    }
+    for (int y = 0; y < iH; y++)
+      for (int x = 0; x < iW; x++)
+        SEGMENT.setPixelColorXY(1 + x, 1 + y, tgHeatColor(d->heat[y * iW + x]));
+  }
+
+  // --- perimeter chasers (clear ring, then draw heads + fading tails) ---
+  for (int r = 0; r < perim; r++) { int x, y; tgRingXY(r, W, H, x, y); SEGMENT.setPixelColorXY(x, y, BLACK); }
+  uint8_t tail = map8(SEGMENT.custom3, 0, 5);
+  for (int i = 0; i < TG_MAX_CHASERS; i++) {
+    TouchChaser &c = d->chasers[i];
+    if (c.life == 0) continue;
+    c.pos += c.speed;
+    while (c.pos >= perim) c.pos -= perim;
+    c.life--;
+    uint8_t lifeBri = (c.life > 60) ? 255 : (uint8_t)map((int)c.life, 0, 60, 0, 255);
+    uint8_t headBri = scale8(c.bri, lifeBri);
+    uint32_t col = SEGMENT.color_from_palette(c.hue, false, false, 255);
+    int head = (int)c.pos;
+    int hx, hy; tgRingXY(((head % perim) + perim) % perim, W, H, hx, hy);
+    SEGMENT.addPixelColorXY(hx, hy, color_fade(col, headBri, true));
+    for (uint8_t t = 1; t <= tail; t++) {
+      int r = ((head - (int)t) % perim + perim) % perim;
+      int tx, ty; tgRingXY(r, W, H, tx, ty);
+      uint8_t tb = scale8(headBri, (uint8_t)(180 - t * (140 / (tail ? tail : 1))));
+      SEGMENT.addPixelColorXY(tx, ty, color_fade(col, tb, true));
+    }
+  }
+
+  return FRAMETIME;
+}
+static const char _data_FX_MODE_TOUCH_GRID[] PROGMEM =
+  "Touch Grid@Speed,Fire,Hz,Cool,Tail;;!;2;sx=40,ix=120,c1=50,c2=128,c3=120";
+
+
 // add more strings here to reduce flash memory usage
 const char AMPWorks::_name[]    PROGMEM = "AMPWorks";
 const char AMPWorks::_enabled[] PROGMEM = "enabled";
@@ -543,6 +695,7 @@ void AMPWorks::setup() {
   strip.addEffect(255, &mode_amp_moving_sin, _data_FX_MODE_AMP_MOVING_SIN);
   strip.addEffect(255, &mode_hmtl_sparkle, _data_FX_MODE_HMTL_SPARKLE);
   strip.addEffect(255, &mode_touch_ripple, _data_FX_MODE_TOUCH_RIPPLE);
+  strip.addEffect(255, &mode_touch_grid, _data_FX_MODE_TOUCH_GRID);
 
   initDone = true;
 }
