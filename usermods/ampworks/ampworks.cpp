@@ -628,10 +628,29 @@ uint16_t mode_touch_grid(void) {
   #endif
 #endif
 
+  // --- audio reactivity (optional): livelier sparks with volume, beat-matched flicker.
+  //     Fire still runs at the baseline rate when silent / no AudioReactive usermod. ---
+  uint8_t audioSpark = 0;   // extra spark probability from loudness
+  uint8_t beatHeat   = 0;   // full-row heat punch on a detected beat (0 = no beat)
+  {
+    um_data_t *um_data = nullptr;
+    if (!UsermodManager::getUMData(&um_data, USERMOD_ID_AUDIOREACTIVE))
+      um_data = simulateSound(SEGMENT.soundSim);  // honours the descriptor's volume flag
+    if (um_data) {
+      float    volumeSmth = *(float*)   um_data->u_data[0];
+      uint8_t *fftResult  =  (uint8_t*) um_data->u_data[2];
+      uint8_t  samplePeak = *(uint8_t*) um_data->u_data[3];
+      uint8_t  vol  = (volumeSmth > 255.0f) ? 255 : (volumeSmth < 0.0f ? 0 : (uint8_t)volumeSmth);
+      uint8_t  bass = fftResult ? fftResult[0] : 0;     // low-frequency energy
+      audioSpark = scale8(qadd8(vol, bass >> 1), 150);  // louder/bassier -> more frequent sparks
+      if (samplePeak) beatHeat = 120 + scale8(vol, 135); // onset -> punch the whole flame base
+    }
+  }
+
   // --- interior fire (rising toward y=0; flame base = row y=iH-1) ---
   if (iW > 0 && iH > 0) {
     uint8_t coolBase = map8(SEGMENT.custom2, 5, 40);
-    uint8_t sparking = map8(SEGMENT.intensity, 40, 200);
+    uint8_t sparking = qadd8(map8(SEGMENT.intensity, 40, 200), audioSpark);
     for (int x = 0; x < iW; x++) {
       for (int y = 0; y < iH; y++) {
         int idx = y * iW + x;
@@ -643,10 +662,9 @@ uint16_t mode_touch_grid(void) {
         int below2 = d->heat[((y < iH - 2) ? (y + 2) : (y + 1)) * iW + x];
         d->heat[y * iW + x] = (uint8_t)((below1 + below2 + below2) / 3);
       }
-      if (random8() < sparking) {
-        int idx = (iH - 1) * iW + x;
-        d->heat[idx] = qadd8(d->heat[idx], random8(160, 255));
-      }
+      int base = (iH - 1) * iW + x;
+      if (random8() < sparking) d->heat[base] = qadd8(d->heat[base], random8(160, 255));
+      if (beatHeat)             d->heat[base] = qadd8(d->heat[base], beatHeat); // beat-matched flicker pulse
     }
     for (int y = 0; y < iH; y++)
       for (int x = 0; x < iW; x++)
@@ -679,7 +697,7 @@ uint16_t mode_touch_grid(void) {
   return FRAMETIME;
 }
 static const char _data_FX_MODE_TOUCH_GRID[] PROGMEM =
-  "Touch Grid@Speed,Fire,Hz,Cool,Tail;;!;2;sx=40,ix=120,c1=50,c2=128,c3=120";
+  "Touch Grid@Speed,Fire,Hz,Cool,Tail;;!;2v;sx=40,ix=120,c1=50,c2=128,c3=120,si=0";
 
 
 // add more strings here to reduce flash memory usage
