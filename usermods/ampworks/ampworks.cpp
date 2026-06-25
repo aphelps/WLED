@@ -585,7 +585,7 @@ static void tgSpawnChaser(GridFireData *d, uint8_t channel, uint8_t nch, int per
   if (nch == 0) nch = 1;
   TouchChaser &c = d->chasers[slot];
   c.pos   = (float)((uint32_t)channel * perim / nch);     // start near the touched electrode
-  c.speed = 0.15f + (float)speedSlider / 255.0f * 0.85f;  // 0.15 .. 1.0 ring units / frame
+  c.speed = 0.04f + (float)speedSlider / 255.0f * 0.40f;  // 0.04 .. 0.44 ring units / frame
   c.hue   = (uint8_t)(channel * (256 / nch));
   c.bri   = bri;
   c.life  = 1200;
@@ -628,10 +628,10 @@ uint16_t mode_touch_grid(void) {
   #endif
 #endif
 
-  // --- audio reactivity (optional): livelier sparks with volume, beat-matched flicker.
+  // --- audio reactivity (optional): livelier sparks with volume, a bright base flash on beats.
   //     Fire still runs at the baseline rate when silent / no AudioReactive usermod. ---
-  uint8_t audioSpark = 0;   // extra spark probability from loudness
-  uint8_t beatHeat   = 0;   // full-row heat punch on a detected beat (0 = no beat)
+  uint8_t audioSpark = 0;    // extra spark probability from loudness
+  uint8_t beatTarget = 0;    // beat -> brighten the flame base toward this heat (0 = no beat)
   {
     um_data_t *um_data = nullptr;
     if (!UsermodManager::getUMData(&um_data, USERMOD_ID_AUDIOREACTIVE))
@@ -642,29 +642,29 @@ uint16_t mode_touch_grid(void) {
       uint8_t  samplePeak = *(uint8_t*) um_data->u_data[3];
       uint8_t  vol  = (volumeSmth > 255.0f) ? 255 : (volumeSmth < 0.0f ? 0 : (uint8_t)volumeSmth);
       uint8_t  bass = fftResult ? fftResult[0] : 0;     // low-frequency energy
-      audioSpark = scale8(qadd8(vol, bass >> 1), 150);  // louder/bassier -> more frequent sparks
-      if (samplePeak) beatHeat = 120 + scale8(vol, 135); // onset -> punch the whole flame base
+      audioSpark = scale8(qadd8(vol, bass >> 1), 90);   // louder/bassier -> somewhat more sparks
+      if (samplePeak) beatTarget = 200 + scale8(vol, 55); // onset -> bright base flash (capped <=255)
     }
   }
 
-  // --- interior fire (rising toward y=0; flame base = row y=iH-1) ---
+  // --- interior fire (rises toward y=0; flame base = row y=iH-1) ---
+  //     Tuned for short columns: strong per-cell cooling + a lossy rise hold a black->red->
+  //     orange->yellow gradient instead of saturating the whole interior to white. Sparks SET
+  //     the base toward a target (no qadd runaway), so only beats briefly flash it bright.
   if (iW > 0 && iH > 0) {
-    uint8_t coolBase = map8(SEGMENT.custom2, 5, 40);
-    uint8_t sparking = qadd8(map8(SEGMENT.intensity, 40, 200), audioSpark);
+    uint8_t cooling  = map8(SEGMENT.custom2, 12, 60);                  // per-cell heat loss / frame
+    uint8_t sparking = qadd8(map8(SEGMENT.intensity, 40, 180), audioSpark);
     for (int x = 0; x < iW; x++) {
-      for (int y = 0; y < iH; y++) {
-        int idx = y * iW + x;
-        uint8_t cool = random8(coolBase + 2);
-        d->heat[idx] = (d->heat[idx] > cool) ? (uint8_t)(d->heat[idx] - cool) : 0;
-      }
-      for (int y = 0; y < iH - 1; y++) {
-        int below1 = d->heat[(y + 1) * iW + x];
-        int below2 = d->heat[((y < iH - 2) ? (y + 2) : (y + 1)) * iW + x];
-        d->heat[y * iW + x] = (uint8_t)((below1 + below2 + below2) / 3);
-      }
+      for (int y = 0; y < iH; y++)
+        d->heat[y * iW + x] = qsub8(d->heat[y * iW + x], random8(cooling + 1));
+      for (int y = 0; y < iH - 1; y++)
+        d->heat[y * iW + x] = scale8(d->heat[(y + 1) * iW + x], 205); // rise one row, lose ~20%
       int base = (iH - 1) * iW + x;
-      if (random8() < sparking) d->heat[base] = qadd8(d->heat[base], random8(160, 255));
-      if (beatHeat)             d->heat[base] = qadd8(d->heat[base], beatHeat); // beat-matched flicker pulse
+      if (random8() < sparking) {
+        uint8_t s = random8(150, 210);
+        if (s > d->heat[base]) d->heat[base] = s;
+      }
+      if (beatTarget && beatTarget > d->heat[base]) d->heat[base] = beatTarget; // beat flash
     }
     for (int y = 0; y < iH; y++)
       for (int x = 0; x < iW; x++)
