@@ -148,8 +148,8 @@ int main() {
     SensorCursor slow = ring.subscribe();
     for (int i = 0; i < 10; i++) ring.push(e);   // 10 events into a 4-slot ring
     RemoteSensorEvent got[8];
-    uint8_t n = ring.drain(slow, got, 8);
-    CHECK(n == 4, "lagging consumer catches up to last `cap` events, no block/overrun");
+    uint8_t drained = ring.drain(slow, got, 8);
+    CHECK(drained == 4, "lagging consumer catches up to last `cap` events, no block/overrun");
   }
 
   printf(g_fail ? "SOME TESTS FAILED\n" : "ALL TESTS PASSED\n");

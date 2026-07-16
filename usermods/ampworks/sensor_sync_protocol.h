@@ -86,7 +86,7 @@ struct SensorCursor {
 struct SensorEventRing {
   RemoteSensorEvent *buf;
   uint8_t            cap;
-  uint32_t           writeSeq;
+  uint32_t           writeSeq;   // total events pushed; 32-bit wraparound (~4e9 events) is unreachable in practice
 
   void push(const RemoteSensorEvent &e) {
     buf[writeSeq % cap] = e;
