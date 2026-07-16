@@ -121,6 +121,37 @@ int main() {
   n = feed(pkt, build_mask(pkt, SS_SENSOR_TOUCH, A, 1, 0b0001), SELF, peers, 4, ev, 32);
   CHECK(n == 1, "seq not consumed by ignored type");
 
+  // 12) Two consumers with independent cursors each see every event and advance independently.
+  {
+    RemoteSensorEvent ringbuf[4];
+    SensorEventRing ring{ ringbuf, 4, 0 };
+    RemoteSensorEvent e{ SS_SENSOR_TOUCH, 1, 1, A, 0 };
+    SensorCursor c1 = ring.subscribe();   // both subscribe before any events -> see all
+    SensorCursor c2 = ring.subscribe();
+    ring.push(e); ring.push(e); ring.push(e);
+    RemoteSensorEvent got[8];
+    uint8_t n1 = ring.drain(c1, got, 8);
+    CHECK(n1 == 3, "consumer1 sees all 3");
+    uint8_t n2 = ring.drain(c2, got, 8);
+    CHECK(n2 == 3, "consumer2 independently sees all 3");
+    // c1 already drained: draining again yields nothing until new events arrive.
+    CHECK(ring.drain(c1, got, 8) == 0, "consumer1 drained -> empty");
+    ring.push(e);
+    CHECK(ring.drain(c1, got, 8) == 1 && ring.drain(c2, got, 8) == 1, "both see the new event");
+  }
+
+  // 13) A consumer that falls > cap behind skips the overwritten gap (never blocks the producer).
+  {
+    RemoteSensorEvent ringbuf[4];
+    SensorEventRing ring{ ringbuf, 4, 0 };
+    RemoteSensorEvent e{ SS_SENSOR_TOUCH, 0, 1, A, 0 };
+    SensorCursor slow = ring.subscribe();
+    for (int i = 0; i < 10; i++) ring.push(e);   // 10 events into a 4-slot ring
+    RemoteSensorEvent got[8];
+    uint8_t n = ring.drain(slow, got, 8);
+    CHECK(n == 4, "lagging consumer catches up to last `cap` events, no block/overrun");
+  }
+
   printf(g_fail ? "SOME TESTS FAILED\n" : "ALL TESTS PASSED\n");
   return g_fail;
 }

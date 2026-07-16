@@ -73,6 +73,38 @@ struct SensorEventSink {
   uint8_t            count;
 };
 
+// Opaque per-consumer read cursor over a SensorEventRing. A consumer obtains one from
+// subscribe() (typically stored in its SEGENV data) and passes it to drain() each frame.
+struct SensorCursor {
+  uint32_t readSeq;
+};
+
+// Monotonic multi-consumer event ring (pure — host-testable). Producers push(); each consumer
+// holds its own SensorCursor and drain()s independently, so every consumer sees every event.
+// A consumer that falls more than `cap` events behind skips the gap (never blocks the producer).
+// `buf` is caller-owned (cap entries); writeSeq is the total number of events ever pushed.
+struct SensorEventRing {
+  RemoteSensorEvent *buf;
+  uint8_t            cap;
+  uint32_t           writeSeq;
+
+  void push(const RemoteSensorEvent &e) {
+    buf[writeSeq % cap] = e;
+    writeSeq++;
+  }
+  SensorCursor subscribe() const { return SensorCursor{ writeSeq }; }  // start from "now"
+  uint8_t drain(SensorCursor &cur, RemoteSensorEvent *out, uint8_t maxOut) const {
+    uint32_t oldest = (writeSeq > cap) ? (writeSeq - cap) : 0;
+    if (cur.readSeq < oldest) cur.readSeq = oldest;    // fell behind -> skip overwritten events
+    uint8_t n = 0;
+    while (cur.readSeq < writeSeq && n < maxOut) {
+      out[n++] = buf[cur.readSeq % cap];
+      cur.readSeq++;
+    }
+    return n;
+  }
+};
+
 static inline void ss_sink_push(SensorEventSink &s, const RemoteSensorEvent &e) {
   if (s.count < s.cap) s.buf[s.count++] = e;
 }
