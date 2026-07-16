@@ -563,7 +563,7 @@ static void tgRingXY(int r, int W, int H, int &x, int &y) {
   if      (r < top)                  { x = r;                          y = 0; }
   else if (r < top + right)          { x = W - 1;                      y = r - top + 1; }
   else if (r < top + right + bottom) { x = W - 2 - (r - top - right);  y = H - 1; }
-  else                               { x = 0;                          y = H - 1 - (r - top - right - bottom); }
+  else                               { x = 0;                          y = H - 2 - (r - top - right - bottom); }
 }
 
 // FastLED-style heat -> fire color (black -> red -> yellow -> white).
@@ -673,7 +673,7 @@ uint16_t mode_touch_grid(void) {
 
   // --- perimeter chasers (clear ring, then draw heads + fading tails) ---
   for (int r = 0; r < perim; r++) { int x, y; tgRingXY(r, W, H, x, y); SEGMENT.setPixelColorXY(x, y, BLACK); }
-  uint8_t tail = map8(SEGMENT.custom3, 0, 5);
+  uint8_t tail = map((int)SEGMENT.custom3, 0, 31, 0, 5); // custom3 is a 5-bit field (0..31)
   for (int i = 0; i < TG_MAX_CHASERS; i++) {
     TouchChaser &c = d->chasers[i];
     if (c.life == 0) continue;
@@ -697,7 +697,7 @@ uint16_t mode_touch_grid(void) {
   return FRAMETIME;
 }
 static const char _data_FX_MODE_TOUCH_GRID[] PROGMEM =
-  "Touch Grid@Speed,Fire,Hz,Cool,Tail;;!;2v;sx=40,ix=120,c1=50,c2=128,c3=120,si=0";
+  "Touch Grid@Speed,Fire,Hz,Cool,Tail;;!;2v;sx=40,ix=120,c1=50,c2=128,c3=24,si=0";
 
 
 // add more strings here to reduce flash memory usage
