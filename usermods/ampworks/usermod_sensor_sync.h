@@ -12,6 +12,8 @@
  * (no router required). Producers broadcast full sensor-state snapshots; receivers derive
  * discrete RemoteSensorEvents (edges for bitmask sensors, direct samples for scalar sensors).
  *
+ * Architecture overview + send/receive flow charts: see SENSOR_SYNC.md (keep it in sync).
+ *
  * The wire format + dispatch logic live in the dependency-free sensor_sync_protocol.h (host
  * unit-tested). This class wires that to a transport (UDP now; ESP-NOW later via ISensorTransport)
  * and to the effect layer.

@@ -7,6 +7,8 @@
 // usermod (usermod_sensor_sync.{h,cpp}) includes this and wires it to WiFiUDP + the effect bus;
 // the host test (tests/sensor_sync_test.cpp) includes only this file and exercises ss_dispatch().
 //
+// Architecture overview + send/receive flow charts: see SENSOR_SYNC.md (keep it in sync).
+//
 // Wire compatibility: the header + touch snapshot are unchanged from version 5, so devices on
 // older builds interoperate for touch. New sensor types are additive — a peer that doesn't know
 // a sensorType simply ignores it (ss_dispatch drops unknown types).
