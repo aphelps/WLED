@@ -309,6 +309,10 @@ struct TouchRippleData {
   uint8_t    replayIdx;                  // next history index to replay
   uint16_t   replayWait;                 // countdown frames until next ghost event
   uint8_t    agcPeak;                    // AGC: running peak for volume normalization
+#ifdef USERMOD_SENSOR_SYNC
+  SensorCursor remoteCursor;             // this segment's own cursor over the remote-event ring
+  bool         remoteSubscribed;         // subscribe lazily on first frame (start from "now")
+#endif
 };
 
 /*
@@ -391,17 +395,22 @@ uint16_t mode_touch_ripple(void) {
     spawnTouchWave(data, e, SEGLEN, maxAge, 255, touchWaveColor(e));
   }
 
-  // Remote touches from other devices (sensor-sync usermod): spawn a wave with a
-  // distinct hue (offset half the palette) so remote interaction is visibly different.
-  // M0 limitation: drains a single global queue — correct for one active Touch Pond segment.
+  // Remote touches from other devices (sensor-sync usermod): spawn a wave with a distinct hue
+  // (offset half the palette) so remote interaction is visibly different. This segment holds its
+  // own drain cursor, so multiple Touch Pond segments each receive every remote event.
 #ifdef USERMOD_SENSOR_SYNC
   {
     UsermodSensorSync *ss = (UsermodSensorSync*) UsermodManager::lookup(USERMOD_ID_SENSOR_SYNC);
     if (ss) {
-      RemoteSensorEvent ev;
-      while (ss->popRemoteEvent(ev)) {
-        if (ev.sensorType == SS_SENSOR_TOUCH && ev.value && ev.channel < MPR121::MAX_SENSORS)
-          spawnTouchWave(data, ev.channel, SEGLEN, maxAge, 255, (uint8_t)(touchWaveColor(ev.channel) + 128));
+      if (!data->remoteSubscribed) { data->remoteCursor = ss->subscribe(); data->remoteSubscribed = true; }
+      RemoteSensorEvent ev[8];
+      uint8_t n;
+      while ((n = ss->drain(data->remoteCursor, ev, 8)) > 0) {
+        for (uint8_t i = 0; i < n; i++) {
+          if (ev[i].sensorType == SS_SENSOR_TOUCH && ev[i].value && ev[i].channel < MPR121::MAX_SENSORS)
+            spawnTouchWave(data, ev[i].channel, SEGLEN, maxAge, 255,
+                           (uint8_t)(touchWaveColor(ev[i].channel) + 128));
+        }
       }
     }
   }
@@ -554,7 +563,11 @@ struct TouchChaser {
 struct GridFireData {
   uint16_t    prevTouched;             // local MPR121 edge state
   TouchChaser chasers[TG_MAX_CHASERS];
-  uint8_t     heat[];                  // (W-2)*(H-2) interior heat (flexible array)
+#ifdef USERMOD_SENSOR_SYNC
+  SensorCursor remoteCursor;           // this segment's own cursor over the remote-event ring
+  bool         remoteSubscribed;       // subscribe lazily on first frame
+#endif
+  uint8_t     heat[];                  // (W-2)*(H-2) interior heat (flexible array — MUST be last)
 };
 
 // Clockwise ring index -> (x,y) on a W x H border. r in [0, 2W+2H-4).
@@ -620,10 +633,13 @@ uint16_t mode_touch_grid(void) {
   #ifdef USERMOD_SENSOR_SYNC
   UsermodSensorSync *ss = (UsermodSensorSync*) UsermodManager::lookup(USERMOD_ID_SENSOR_SYNC);
   if (ss) {
-    RemoteSensorEvent ev;
-    while (ss->popRemoteEvent(ev))
-      if (ev.sensorType == SS_SENSOR_TOUCH && ev.value)
-        tgSpawnChaser(d, ev.channel, MPR121::MAX_SENSORS, perim, 90, SEGMENT.speed);
+    if (!d->remoteSubscribed) { d->remoteCursor = ss->subscribe(); d->remoteSubscribed = true; }
+    RemoteSensorEvent ev[8];
+    uint8_t n;
+    while ((n = ss->drain(d->remoteCursor, ev, 8)) > 0)
+      for (uint8_t i = 0; i < n; i++)
+        if (ev[i].sensorType == SS_SENSOR_TOUCH && ev[i].value && ev[i].channel < MPR121::MAX_SENSORS)
+          tgSpawnChaser(d, ev[i].channel, MPR121::MAX_SENSORS, perim, 90, SEGMENT.speed);
   }
   #endif
 #endif
