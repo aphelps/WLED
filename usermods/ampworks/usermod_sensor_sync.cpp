@@ -188,3 +188,7 @@ bool UsermodSensorSync::readFromConfig(JsonObject &root) {
   }
   return true;
 }
+
+// WLED 16.x self-registration.
+static UsermodSensorSync sensor_sync_usermod;
+REGISTER_USERMOD(sensor_sync_usermod);

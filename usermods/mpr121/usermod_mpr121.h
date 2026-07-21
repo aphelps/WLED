@@ -156,5 +156,5 @@ class UsermodMPR121 : public Usermod {
   }
 };
 
-const char UsermodMPR121::_name[]    PROGMEM = "MPR121";
-const char UsermodMPR121::_enabled[] PROGMEM = "enabled";
+// _name/_enabled definitions + WLED 16.x self-registration live in usermod_mpr121.cpp,
+// so this header can be #included by other TUs (e.g. ampworks.cpp) without ODR conflicts.

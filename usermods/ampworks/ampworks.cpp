@@ -5,11 +5,15 @@
 #ifdef USERMOD_SENSOR_SYNC
   #include "../usermods/ampworks/usermod_sensor_sync.h"
 #endif
+// WLED 16.x dropped FastLED; re-expose the 5 removed helpers (random8/random16/map8/beatsin8/
+// sqrt16) via WLED-16 natives so the effect code below is unchanged. See fastled_compat.h.
+#include "colors.h"          // scale8/qadd8/qsub8/color_fade (bundled fastled_slim)
+#include "fastled_compat.h"  // random8/random16/map8/beatsin8/sqrt16 → WLED-16 natives
 
 /*
  * AMP's initial test mode
  */
-uint16_t mode_amp_test(void) {
+void mode_amp_test(void) {
   uint32_t cycleTime = 1000 + (255 - SEGMENT.speed)*100;
   uint32_t it = strip.now / cycleTime;
   if (it != SEGENV.step) {
@@ -18,18 +22,18 @@ uint16_t mode_amp_test(void) {
   }
   SEGMENT.fill(SEGMENT.color_from_palette(SEGENV.aux0,
                                      true,
-                                        (strip.paletteBlend == 1 || strip.paletteBlend == 3),
+                                        (paletteBlend == 1 || paletteBlend == 3),
                                         0));
 
-  return FRAMETIME;
+  return;
 }
 static const char _data_FX_MODE_AMP_TEST[] PROGMEM = "AMP Test Usermod v2.1@!;!,!;!;01";
 
 
 /* This effect sets every third pixel of the segment to red */
-uint16_t mode_amp_ai(void) {
+void mode_amp_ai(void) {
   // if segment length is 0 just return
-  if (SEGLEN == 0) return FRAMETIME;
+  if (SEGLEN == 0) return;
 
   // spacing is controlled by SEGMENT.custom1 (c1). If unset (0) use default 3.
   uint16_t spacing = SEGMENT.custom1 ? SEGMENT.custom1 : 3;
@@ -54,7 +58,7 @@ uint16_t mode_amp_ai(void) {
     }
   }
 
-  return FRAMETIME;
+  return;
 }
 // expose 3 sliders: speed, intensity, Spacing (maps to custom1), and default c1=3
 static const char _data_FX_MODE_AMP_AI[] PROGMEM = "AMP AI@!,!,Spacing;!,!;!;01;c1=3";
@@ -62,13 +66,13 @@ static const char _data_FX_MODE_AMP_AI[] PROGMEM = "AMP AI@!,!,Spacing;!,!;!;01;
 /* This effect sets all pixels to the same color, with the brightness based on
  * the current audio input volume
  * */
-uint16_t mode_amp_ai_audio(void) {
+void mode_amp_ai_audio(void) {
   um_data_t *um_data = nullptr;
   // try to get audio data from audioreactive usermod, fall back to simulated sound
   if (!UsermodManager::getUMData(&um_data, USERMOD_ID_AUDIOREACTIVE)) {
     um_data = simulateSound(SEGMENT.soundSim);
   }
-  if (!um_data) return FRAMETIME; // nothing to do
+  if (!um_data) return; // nothing to do
 
   // audio data layout (as used throughout FX.cpp):
   // u_data[0] -> float volumeSmth
@@ -90,7 +94,7 @@ uint16_t mode_amp_ai_audio(void) {
   uint32_t col = color_blend(BLACK, SEGCOLOR(0), bri);
   SEGMENT.fill(col);
 
-  return FRAMETIME;
+  return;
 }
 // PROGMEM description for audio mode
 static const char _data_FX_MODE_AMP_AI_AUDIO[] PROGMEM = "AMP AI Audio@!;!,!;!;01";
@@ -122,11 +126,11 @@ static void set_moving_sin_point(struct Moving_Point *data, uint32_t color) {
   }
 }
 
-uint16_t mode_amp_moving_sin(void) {
+void mode_amp_moving_sin(void) {
   uint8_t points = map8(SEGMENT.custom1, 1, 10);
   uint8_t i;
 
-  if (!SEGENV.allocateData(sizeof(struct Moving_Sin_Data))) return FRAMETIME;
+  if (!SEGENV.allocateData(sizeof(struct Moving_Sin_Data))) return;
 
   struct Moving_Sin_Data *data = (struct Moving_Sin_Data *)SEGENV.data;
   if (SEGENV.call == 0) {
@@ -170,7 +174,7 @@ uint16_t mode_amp_moving_sin(void) {
     set_moving_sin_point(point, SEGCOLOR(i));
   }
 
-  return FRAMETIME;
+  return;
 }
 // PROGMEM description for audio mode
 static const char _data_FX_MODE_AMP_MOVING_SIN[] PROGMEM = "AMP Moving SIN@Speed,Width,Points;!,!;!;01;sx=32,c1=1";
@@ -199,11 +203,11 @@ static const char _data_FX_MODE_AMP_MOVING_SIN[] PROGMEM = "AMP Moving SIN@Speed
  *   Color 2    → background color
  *   Palette    → sparkle color source
  */
-uint16_t mode_hmtl_sparkle(void) {
-  if (SEGLEN == 0) return FRAMETIME;
+void mode_hmtl_sparkle(void) {
+  if (SEGLEN == 0) return;
 
   unsigned dataSize = sizeof(uint32_t) * SEGLEN;
-  if (!SEGENV.allocateData(dataSize)) { SEGMENT.fill(SEGCOLOR(1)); return FRAMETIME; }
+  if (!SEGENV.allocateData(dataSize)) { SEGMENT.fill(SEGCOLOR(1)); return; }
   uint32_t* targets = reinterpret_cast<uint32_t*>(SEGENV.data);
 
   if (SEGENV.call == 0) {
@@ -258,7 +262,7 @@ uint16_t mode_hmtl_sparkle(void) {
                                      step_ch(b, tb, fade_step), 0));
   }
 
-  return FRAMETIME;
+  return;
 }
 // Speed = update rate; Intensity = sparkle %; c1 = BG reset %; c2 = fade speed (0=snap, 255=slow)
 // Color 1 = sparkle base (palette), Color 2 = background
@@ -352,20 +356,20 @@ static void spawnTouchWave(TouchRippleData *data, uint8_t e, uint16_t segLen, ui
 }
 #endif
 
-uint16_t mode_touch_ripple(void) {
+void mode_touch_ripple(void) {
 #ifndef USERMOD_MPR121
-  return FRAMETIME;
+  return;
 #else
-  if (SEGLEN == 0) return FRAMETIME;
+  if (SEGLEN == 0) return;
 
   // mpr may report no physical sensor (display-only node): the touched() wrappers then
   // return false, so local-touch logic is inert but remote/audio waves still render.
   UsermodMPR121 *mpr = (UsermodMPR121*) UsermodManager::lookup(USERMOD_ID_MPR121);
-  if (!mpr) return FRAMETIME;
+  if (!mpr) return;
 
   if (mpr->isSensorFound()) mpr->setUpdateHz(map8(SEGMENT.custom1, 1, 100));
 
-  if (!SEGENV.allocateData(sizeof(TouchRippleData))) return FRAMETIME;
+  if (!SEGENV.allocateData(sizeof(TouchRippleData))) return;
   TouchRippleData *data = reinterpret_cast<TouchRippleData*>(SEGENV.data);
   if (SEGENV.call == 0) { memset(data, 0, sizeof(TouchRippleData)); data->agcPeak = 128; }
 
@@ -532,7 +536,7 @@ uint16_t mode_touch_ripple(void) {
     }
   }
 
-  return FRAMETIME;
+  return;
 #endif
 }
 static const char _data_FX_MODE_TOUCH_RIPPLE[] PROGMEM =
@@ -604,17 +608,17 @@ static void tgSpawnChaser(GridFireData *d, uint8_t channel, uint8_t nch, int per
   c.life  = 1200;
 }
 
-uint16_t mode_touch_grid(void) {
-  if (!SEGMENT.is2D()) return FRAMETIME;
+void mode_touch_grid(void) {
+  if (!SEGMENT.is2D()) return;
   const int W = SEGMENT.virtualWidth();
   const int H = SEGMENT.virtualHeight();
-  if (W < 3 || H < 3) return FRAMETIME;
+  if (W < 3 || H < 3) return;
 
   const int perim = 2 * W + 2 * H - 4;
   const int iW = W - 2, iH = H - 2;        // interior dims
   const int heatBytes = iW * iH;
 
-  if (!SEGENV.allocateData(sizeof(GridFireData) + heatBytes)) return FRAMETIME;
+  if (!SEGENV.allocateData(sizeof(GridFireData) + heatBytes)) return;
   GridFireData *d = reinterpret_cast<GridFireData*>(SEGENV.data);
   if (SEGENV.call == 0) memset(d, 0, sizeof(GridFireData) + heatBytes);
 
@@ -710,7 +714,7 @@ uint16_t mode_touch_grid(void) {
     }
   }
 
-  return FRAMETIME;
+  return;
 }
 static const char _data_FX_MODE_TOUCH_GRID[] PROGMEM =
   "Touch Grid@Speed,Fire,Hz,Cool,Tail;;!;2v;sx=40,ix=120,c1=50,c2=128,c3=24,si=0";
@@ -733,3 +737,7 @@ void AMPWorks::setup() {
 
   initDone = true;
 }
+
+// WLED 16.x self-registration (replaces the old central usermods_list.cpp).
+static AMPWorks ampworks_usermod;
+REGISTER_USERMOD(ampworks_usermod);
