@@ -304,7 +304,10 @@
 #endif
 
 //APA102
-#ifdef WLED_USE_ETHERNET
+// AMPWORKS_DOTSTAR_HSPI: route the first DotStar bus via HSPI so it does NOT reserve VSPI
+// MISO=GPIO19 — which is the MPR121 SDA on the AMPWorks APA102+MPR121 boards. Without it the
+// LED bus and I2C fight over GPIO19 and touch is unreliable across reboots.
+#if defined(WLED_USE_ETHERNET) || defined(AMPWORKS_DOTSTAR_HSPI)
 // fix for #2542 (by @BlackBird77)
 #define B_HS_DOT_3 NeoPixelBus<DotStarBgrFeature, DotStarEsp32HspiHzMethod> //hardware HSPI (was DotStarEsp32DmaHspi5MhzMethod in NPB @ 2.6.9)
 #else
