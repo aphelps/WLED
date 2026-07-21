@@ -1,0 +1,7 @@
+{
+  "name": "ampworks",
+  "build": {
+    "libArchive": false,
+    "srcFilter": ["+<*>", "-<tests/>"]
+  }
+}
