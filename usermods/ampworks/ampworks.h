@@ -38,5 +38,5 @@ class AMPWorks : public Usermod {
       return !root[FPSTR(_name)].isNull();
     }
 
-    uint16_t getId() override { return USERMOD_ID_EXAMPLE; }
+    uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
 };

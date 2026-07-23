@@ -75,8 +75,16 @@ jobs:
     - name: Install PlatformIO
       run: pip install -r requirements.txt
 
+    # The AMPWorks mpr121 usermod depends on the MPR121 + Debug libraries, which live
+    # in aphelps/ArduinoLibs (vendored as a submodule in the parent WLED_dev repo, absent
+    # from this fork's standalone checkout). Fetch them and expose via PLATFORMIO_LIB_EXTRA_DIRS
+    # so the `usermods` env (custom_usermods = *) can build mpr121. Harmless for other envs.
+    - name: Fetch ArduinoLibs (MPR121 + Debug) for AMPWorks usermods
+      run: git clone --depth 1 https://github.com/aphelps/ArduinoLibs.git "${{ runner.temp }}/ArduinoLibs"
     - name: Build firmware
       run: pio run -e ${{ matrix.environment }}
+      env:
+        PLATFORMIO_LIB_EXTRA_DIRS: ${{ runner.temp }}/ArduinoLibs
     - name: Get artifact name from bin filename
       id: artifact_name
       run: |
