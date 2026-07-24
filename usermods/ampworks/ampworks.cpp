@@ -335,7 +335,7 @@ struct TouchRippleData {
  */
 // Electrode/channel count for wave layout. With MPR121 present, mirror MAX_SENSORS; on a
 // display-only node (SENSOR_SYNC but no MPR121) MPR121::MAX_SENSORS is undefined, so use a
-// fixed 16 which safely covers the MPR121 range (13) for remote-channel → position/hue mapping.
+// fixed 16 which safely covers the MPR121 range (MAX_SENSORS = 12) for remote-channel → position/hue mapping.
 #ifdef USERMOD_MPR121
   #define TOUCH_NCH_MAX ((uint8_t)MPR121::MAX_SENSORS)
 #else
