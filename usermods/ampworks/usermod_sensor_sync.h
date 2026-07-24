@@ -55,6 +55,38 @@ class UdpSensorTransport : public ISensorTransport {
   bool     started   = false;
 };
 
+// The demux classifier ss_is_our_frame() lives in the dependency-free sensor_sync_protocol.h so
+// it is host-testable and shared with the RX hook below.
+
+#ifndef WLED_DISABLE_ESPNOW
+// ESP-NOW transport: broadcast via quickEspNow; RX is callback-driven, so inbound frames are
+// fed (from UsermodSensorSync::onEspNowMessage) into a small fixed ring that poll() drains,
+// preserving the poll() semantics receiveLoop() expects. The WLED radio is already started in
+// wled.cpp — we never (re)init it here, we just start accepting frames on begin().
+class EspNowSensorTransport : public ISensorTransport {
+ public:
+  bool begin(uint16_t port) override;   // port is vestigial for ESP-NOW; ignored (logged)
+  void end() override;
+  bool broadcast(const uint8_t *buf, int len) override;
+  int  poll(uint8_t *buf, int maxLen) override;
+
+  bool isStarted() const { return started; }
+  // Push an inbound frame into the RX ring (called from the ESP-NOW receive hook). Silently
+  // drops if not started, oversized, or the ring is full (newest frames win via keyframe re-sync).
+  void feed(const uint8_t *data, int len);
+
+ private:
+  static const uint8_t  RX_RING   = 6;                       // recent-datagram ring depth
+  static const uint16_t RX_SLOT_LEN = sizeof(SensorSyncHeader) + 64;
+  struct Slot { uint8_t buf[RX_SLOT_LEN]; uint16_t len; };
+  Slot     ring[RX_RING] = {};
+  uint8_t  head = 0;                                          // next slot to pop
+  uint8_t  tail = 0;                                          // next slot to write
+  uint8_t  count = 0;                                         // occupied slots
+  bool     started = false;
+};
+#endif
+
 class UsermodSensorSync : public Usermod {
  public:
   static const char _name[];
@@ -81,6 +113,13 @@ class UsermodSensorSync : public Usermod {
   void addToConfig(JsonObject &root) override;
   bool readFromConfig(JsonObject &root) override;
 
+#ifndef WLED_DISABLE_ESPNOW
+  // WLED routes inbound ESP-NOW here before its own linked-remote handling. We claim (return
+  // true) only OUR SensorSync frames when the ESP-NOW transport is active; everything else falls
+  // through untouched so WLED's own sync traffic is never disturbed.
+  bool onEspNowMessage(uint8_t *sender, uint8_t *payload, uint8_t len) override;
+#endif
+
  private:
   static const uint8_t  EVENT_RING   = 32;   // per-consumer cursors read from this monotonic ring
   static const uint8_t  MAX_PEERS     = 8;    // per-device snapshot state for edge derivation
@@ -93,8 +132,15 @@ class UsermodSensorSync : public Usermod {
   uint32_t configId   = 0;       // 0 = auto-derive
   uint32_t deviceId   = 0;
   uint32_t keyframeMs = 3000;    // periodic full-snapshot re-broadcast (0 = off)
+  bool     useEspNow  = false;   // false = UDP (default, unchanged behavior); true = ESP-NOW
 
-  UdpSensorTransport transport;
+  // Both transports are owned; `transport` points at the active one (defaults to UDP so the
+  // out-of-box behavior is byte-for-byte the pre-M3a UDP path). Selection swaps the pointer.
+  UdpSensorTransport udpTransport;
+#ifndef WLED_DISABLE_ESPNOW
+  EspNowSensorTransport espNowTransport;
+#endif
+  ISensorTransport *transport = &udpTransport;
   bool     started    = false;
   uint16_t txSeq      = 0;
   uint32_t txCount    = 0;
