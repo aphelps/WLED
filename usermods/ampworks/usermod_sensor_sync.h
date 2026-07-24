@@ -2,6 +2,7 @@
 
 #include "wled.h"
 #include "sensor_sync_protocol.h"   // wire format + pure ss_parse_header/ss_dispatch
+#include "sensor_sync_ring.h"       // dependency-free SPSC RX ring (host-tested)
 
 #ifndef SENSOR_SYNC_PORT
   #define SENSOR_SYNC_PORT 21330   // no external meaning; avoids WLED's 21324 notifier / 65506 node list
@@ -71,18 +72,18 @@ class EspNowSensorTransport : public ISensorTransport {
   int  poll(uint8_t *buf, int maxLen) override;
 
   bool isStarted() const { return started; }
-  // Push an inbound frame into the RX ring (called from the ESP-NOW receive hook). Silently
-  // drops if not started, oversized, or the ring is full (newest frames win via keyframe re-sync).
+  // Push an inbound frame into the RX ring (the PRODUCER side; called from the ESP-NOW receive
+  // hook, which QuickEspNow runs on a dedicated FreeRTOS task). Silently drops if not started,
+  // oversized, or the ring is full (drop-newest — a keyframe re-broadcast re-syncs state).
   void feed(const uint8_t *data, int len);
 
  private:
-  static const uint8_t  RX_RING   = 6;                       // recent-datagram ring depth
+  // Lock-free SPSC ring: producer feed() (ESP-NOW RX task) vs consumer poll() (loop() task).
+  // Correctness comes from the two-index (head/tail) design in SpscByteRing — no shared count,
+  // no mutex. Depth RX_RING gives (RX_RING - 1) usable slots.
+  static const uint8_t  RX_RING     = 7;                       // 6 usable slots (one reserved)
   static const uint16_t RX_SLOT_LEN = sizeof(SensorSyncHeader) + 64;
-  struct Slot { uint8_t buf[RX_SLOT_LEN]; uint16_t len; };
-  Slot     ring[RX_RING] = {};
-  uint8_t  head = 0;                                          // next slot to pop
-  uint8_t  tail = 0;                                          // next slot to write
-  uint8_t  count = 0;                                         // occupied slots
+  SpscByteRing<RX_RING, RX_SLOT_LEN> rxRing;
   bool     started = false;
 };
 #endif

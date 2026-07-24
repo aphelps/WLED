@@ -46,14 +46,14 @@ bool EspNowSensorTransport::begin(uint16_t port) {
   // ESP-NOW has no ports; the radio is already up (quickEspNow started in wled.cpp). We only
   // flip on and start accepting frames from the RX hook. `port` kept for the seam; ignored.
   (void)port;
-  head = tail = count = 0;
+  rxRing.clear();
   started = true;
   DEBUG_PRINTLN(F("SensorSync: ESP-NOW transport started"));
   return true;
 }
 void EspNowSensorTransport::end() {
   started = false;
-  head = tail = count = 0;
+  rxRing.clear();
 }
 bool EspNowSensorTransport::broadcast(const uint8_t *buf, int len) {
   if (!started) return false;
@@ -62,24 +62,16 @@ bool EspNowSensorTransport::broadcast(const uint8_t *buf, int len) {
   return quickEspNow.send(ESPNOW_BROADCAST_ADDRESS, buf, (size_t)len) == COMMS_SEND_OK;
 }
 void EspNowSensorTransport::feed(const uint8_t *data, int len) {
+  // PRODUCER (ESP-NOW RX task). The SPSC ring handles the oversized/garbage/full checks and
+  // publishes atomically via its head index — safe against the concurrent poll() consumer.
   if (!started) return;
-  if (data == nullptr || len <= 0 || len > (int)RX_SLOT_LEN) return;   // ignore oversized/garbage
-  if (count >= RX_RING) return;                                        // ring full — drop (keyframe re-syncs)
-  Slot &s = ring[tail];
-  memcpy(s.buf, data, len);
-  s.len = (uint16_t)len;
-  tail = (tail + 1) % RX_RING;
-  count++;
+  rxRing.push(data, len);   // returns false on drop; nothing else to do
 }
 int EspNowSensorTransport::poll(uint8_t *buf, int maxLen) {
-  if (!started || count == 0) return 0;
-  Slot &s = ring[head];
-  int n = s.len;
-  if (n > maxLen) { head = (head + 1) % RX_RING; count--; return 0; }  // oversized — drop it
-  memcpy(buf, s.buf, n);
-  head = (head + 1) % RX_RING;
-  count--;
-  return n;
+  // CONSUMER (loop() task). pop() skips any bad/oversized slot and keeps draining, so a single
+  // malformed frame never returns 0 and strands the frames queued behind it.
+  if (!started) return 0;
+  return rxRing.pop(buf, maxLen);
 }
 #endif
 
