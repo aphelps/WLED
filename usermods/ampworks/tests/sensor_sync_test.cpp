@@ -152,6 +152,46 @@ int main() {
     CHECK(drained == 4, "lagging consumer catches up to last `cap` events, no block/overrun");
   }
 
+  // 14) ESP-NOW demux classifier (ss_is_our_frame): the gate the edge transport uses in
+  //     onEspNowMessage so it claims only our AMPS frames and never WLED's own sync traffic.
+  {
+    // (a) a well-formed AMPS SensorSync frame is accepted.
+    int len = build_mask(pkt, SS_SENSOR_TOUCH, A, 1, 0b0001);
+    CHECK(ss_is_our_frame(pkt, len), "demux: AMPS frame accepted");
+
+    // (b) a WLED ESP-NOW sync frame (magic 'W') is rejected.
+    uint8_t wled[8] = { 'W', 0, 0, 0, 0, 0, 0, 0 };
+    CHECK(!ss_is_our_frame(wled, sizeof(wled)), "demux: WLED 'W' frame rejected");
+
+    // (c) too-short buffer (< header) is rejected.
+    CHECK(!ss_is_our_frame(pkt, 3), "demux: too-short buffer rejected");
+
+    // (d) header-length garbage (right size, wrong magic) is rejected.
+    uint8_t garbage[sizeof(SensorSyncHeader)];
+    memset(garbage, 0xAB, sizeof(garbage));
+    CHECK(!ss_is_our_frame(garbage, sizeof(garbage)), "demux: garbage rejected");
+
+    // (e) null pointer is rejected (defensive).
+    CHECK(!ss_is_our_frame(nullptr, 64), "demux: null buffer rejected");
+
+    // (f) correct magic but a claimed dataLen that overruns the buffer is rejected.
+    {
+      SensorSyncHeader h; memcpy(&h, pkt, sizeof(h));
+      h.dataLen = 200;               // claims far more payload than present
+      memcpy(pkt, &h, sizeof(h));
+      CHECK(!ss_is_our_frame(pkt, len), "demux: truncated payload rejected");
+    }
+
+    // (g) correct magic but wrong version is rejected (rollout-interop guard).
+    {
+      int l2 = build_mask(pkt, SS_SENSOR_TOUCH, A, 1, 0b0001);
+      SensorSyncHeader h; memcpy(&h, pkt, sizeof(h));
+      h.version = SENSOR_SYNC_VERSION + 1;
+      memcpy(pkt, &h, sizeof(h));
+      CHECK(!ss_is_our_frame(pkt, l2), "demux: wrong version rejected");
+    }
+  }
+
   printf(g_fail ? "SOME TESTS FAILED\n" : "ALL TESTS PASSED\n");
   return g_fail;
 }

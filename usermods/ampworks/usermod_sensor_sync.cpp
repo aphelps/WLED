@@ -39,6 +39,43 @@ int UdpSensorTransport::poll(uint8_t *buf, int maxLen) {
 }
 
 // ---------------------------------------------------------------------------
+// ESP-NOW transport (M3a — single-hop broadcast; drop-in behind ISensorTransport)
+// ---------------------------------------------------------------------------
+#ifndef WLED_DISABLE_ESPNOW
+bool EspNowSensorTransport::begin(uint16_t port) {
+  // ESP-NOW has no ports; the radio is already up (quickEspNow started in wled.cpp). We only
+  // flip on and start accepting frames from the RX hook. `port` kept for the seam; ignored.
+  (void)port;
+  rxRing.clear();
+  started = true;
+  DEBUG_PRINTLN(F("SensorSync: ESP-NOW transport started"));
+  return true;
+}
+void EspNowSensorTransport::end() {
+  started = false;
+  rxRing.clear();
+}
+bool EspNowSensorTransport::broadcast(const uint8_t *buf, int len) {
+  if (!started) return false;
+  if (statusESPNow != ESP_NOW_STATE_ON) return false;   // radio not up
+  // send() returns COMMS_SEND_OK (0) on enqueue success, like udp.cpp treats !err as success.
+  return quickEspNow.send(ESPNOW_BROADCAST_ADDRESS, buf, (size_t)len) == COMMS_SEND_OK;
+}
+void EspNowSensorTransport::feed(const uint8_t *data, int len) {
+  // PRODUCER (ESP-NOW RX task). The SPSC ring handles the oversized/garbage/full checks and
+  // publishes atomically via its head index — safe against the concurrent poll() consumer.
+  if (!started) return;
+  rxRing.push(data, len);   // returns false on drop; nothing else to do
+}
+int EspNowSensorTransport::poll(uint8_t *buf, int maxLen) {
+  // CONSUMER (loop() task). pop() skips any bad/oversized slot and keeps draining, so a single
+  // malformed frame never returns 0 and strands the frames queued behind it.
+  if (!started) return 0;
+  return rxRing.pop(buf, maxLen);
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Usermod
 // ---------------------------------------------------------------------------
 void UsermodSensorSync::setup() {
@@ -55,7 +92,7 @@ void UsermodSensorSync::loop() {
 
   if (!(Network.isConnected() || apActive)) { started = false; return; }
   if (!started) {
-    if (!transport.begin(port)) return;
+    if (!transport->begin(port)) return;
     started = true;
   }
 
@@ -93,7 +130,7 @@ bool UsermodSensorSync::sendMessage(uint8_t sensorType, const uint8_t *data, uin
   h.timestamp  = millis() + strip.timebase;
   memcpy(buf, &h, sizeof(h));
   memcpy(buf + sizeof(h), data, dataLen);
-  if (!transport.broadcast(buf, sizeof(h) + dataLen)) { txSeq--; return false; }  // unwind seq on fail
+  if (!transport->broadcast(buf, sizeof(h) + dataLen)) { txSeq--; return false; }  // unwind seq on fail
   txCount++;
   return true;
 }
@@ -112,7 +149,7 @@ bool UsermodSensorSync::publishSample(uint8_t sensorType, uint8_t channel, int16
 void UsermodSensorSync::receiveLoop() {
   uint8_t buf[RX_BUF_LEN];
   int rd;
-  while ((rd = transport.poll(buf, sizeof(buf))) > 0) {
+  while ((rd = transport->poll(buf, sizeof(buf))) > 0) {
     SensorSyncHeader h;
     if (!ss_parse_header(buf, rd, deviceId, h)) continue;
     RemoteSensorEvent evbuf[16];
@@ -124,6 +161,20 @@ void UsermodSensorSync::receiveLoop() {
       if (peers[i].used && peers[i].deviceId == h.deviceId) { peerLastSeen[i] = millis(); break; }
   }
 }
+
+#ifndef WLED_DISABLE_ESPNOW
+// WLED calls this for every inbound ESP-NOW datagram (before its own linked-remote handling).
+// Only feed the ring — and claim the frame — when ESP-NOW is our active transport AND the payload
+// is one of OUR frames (ss_is_our_frame demuxes AMPS from WLED's 'W' sync + short/garbage). Any
+// other frame: return false so WLED's own handling proceeds undisturbed.
+bool UsermodSensorSync::onEspNowMessage(uint8_t *sender, uint8_t *payload, uint8_t len) {
+  (void)sender;
+  if (!enabled || !useEspNow || !espNowTransport.isStarted()) return false;
+  if (!ss_is_our_frame(payload, (int)len)) return false;
+  espNowTransport.feed(payload, (int)len);
+  return true;   // claimed — it's ours; don't let WLED process it
+}
+#endif
 
 void UsermodSensorSync::broadcastLocalState() {
 #ifdef USERMOD_MPR121
@@ -163,7 +214,9 @@ void UsermodSensorSync::addToJsonInfo(JsonObject &root) {
   if (user.isNull()) user = root.createNestedObject("u");
   JsonArray arr = user.createNestedArray("Sensor Sync");
   arr.add(started ? txCount : 0);
-  arr.add(started ? " sent" : " (offline)");
+  if (!started)      arr.add(" (offline)");
+  else if (useEspNow) arr.add(" sent (ESP-NOW)");
+  else                arr.add(" sent (UDP)");
 }
 
 void UsermodSensorSync::addToConfig(JsonObject &root) {
@@ -172,19 +225,36 @@ void UsermodSensorSync::addToConfig(JsonObject &root) {
   top["port"]       = port;
   top["id"]         = configId;
   top["keyframeMs"] = keyframeMs;
+  top["useEspNow"]  = useEspNow;   // false = UDP (default); true = ESP-NOW broadcast (M3a)
 }
 
 bool UsermodSensorSync::readFromConfig(JsonObject &root) {
   JsonObject top = root[FPSTR(_name)];
   if (top.isNull()) return false;
-  uint16_t portPrev = port;
+  uint16_t portPrev      = port;
+  bool     useEspNowPrev = useEspNow;
   getJsonValue(top[FPSTR(_enabled)], enabled);
   getJsonValue(top["port"], port);
   getJsonValue(top["id"],   configId);
   getJsonValue(top["keyframeMs"], keyframeMs);
+  getJsonValue(top["useEspNow"], useEspNow);
+#ifdef WLED_DISABLE_ESPNOW
+  useEspNow = false;   // no ESP-NOW in this build — force UDP regardless of cfg
+#endif
+  bool changed = (port != portPrev) || (useEspNow != useEspNowPrev);
+  // If the active transport is changing, tear down the OLD one (still pointed to by `transport`)
+  // before swapping, so it releases its resources cleanly.
+  if (initDone && changed && started) transport->end();
+
+  // Point `transport` at the selected impl (UDP by default). Cheap to redo every read.
+#ifndef WLED_DISABLE_ESPNOW
+  transport = useEspNow ? (ISensorTransport*)&espNowTransport : (ISensorTransport*)&udpTransport;
+#else
+  transport = &udpTransport;
+#endif
   if (initDone) {
     deviceId = configId ? configId : deriveDeviceId();
-    if (port != portPrev) started = false;  // rebind on next loop
+    if (changed) started = false;   // rebind on next loop (mirrors port!=portPrev)
   }
   return true;
 }

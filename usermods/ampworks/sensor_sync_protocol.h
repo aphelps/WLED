@@ -127,6 +127,23 @@ static inline SensorPeer *ss_peer_slot(SensorPeer *peers, uint8_t maxPeers, uint
   return &peers[0];
 }
 
+// Cheap demux classifier: is `pkt` (len bytes) one of OUR SensorSync frames? Checks length,
+// magic ('AMPS'), version, and that the claimed payload fits — nothing about a specific sender.
+// Used by the ESP-NOW RX hook to separate our frames from WLED's own sync traffic (magic 'W')
+// and from short/garbage buffers, WITHOUT rejecting our own broadcasts (no selfId check here).
+// Pure/host-testable; ss_parse_header layers the selfId + msgType checks on top for the RX path.
+static inline bool ss_is_our_frame(const uint8_t *pkt, int len) {
+  if (pkt == 0) return false;
+  if (len < (int)sizeof(SensorSyncHeader)) return false;
+  SensorSyncHeader h;
+  memcpy(&h, pkt, sizeof(h));
+  if (!(h.magic[0] == 'A' && h.magic[1] == 'M' && h.magic[2] == 'P' && h.magic[3] == 'S'))
+    return false;
+  if (h.version != SENSOR_SYNC_VERSION) return false;
+  if ((int)sizeof(SensorSyncHeader) + (int)h.dataLen > len) return false;
+  return true;
+}
+
 // Validate a datagram's header. Returns true and fills `out` if the packet is a well-formed
 // SensorSync snapshot from another device. `selfId` is rejected so we ignore our own broadcasts.
 static inline bool ss_parse_header(const uint8_t *pkt, int len, uint32_t selfId,
