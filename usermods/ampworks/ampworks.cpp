@@ -333,10 +333,18 @@ struct TouchRippleData {
  * c1        → MPR121 poll rate (Hz)
  * c2        → background fade rate (low=short trail, high=long trail)
  */
+// Electrode/channel count for wave layout. With MPR121 present, mirror MAX_SENSORS; on a
+// display-only node (SENSOR_SYNC but no MPR121) MPR121::MAX_SENSORS is undefined, so use a
+// fixed 16 which safely covers the MPR121 range (MAX_SENSORS = 12) for remote-channel → position/hue mapping.
 #ifdef USERMOD_MPR121
+  #define TOUCH_NCH_MAX ((uint8_t)MPR121::MAX_SENSORS)
+#else
+  #define TOUCH_NCH_MAX 16u
+#endif
+
 // Default palette hue for an electrode's wave (local/ghost/audio waves).
 static inline uint8_t touchWaveColor(uint8_t e) {
-  return (uint8_t)(e * (256 / MPR121::MAX_SENSORS));
+  return (uint8_t)(e * (256 / TOUCH_NCH_MAX));
 }
 
 static void spawnTouchWave(TouchRippleData *data, uint8_t e, uint16_t segLen, uint8_t maxAge, uint8_t ghostBri, uint8_t color) {
@@ -348,26 +356,18 @@ static void spawnTouchWave(TouchRippleData *data, uint8_t e, uint16_t segLen, ui
   }
   if (slot < 0) slot = oldestSlot;
   data->waves[slot] = {
-    (uint16_t)((uint32_t)e * segLen / MPR121::MAX_SENSORS),
+    (uint16_t)((uint32_t)e * segLen / TOUCH_NCH_MAX),
     0, maxAge,
     color,
     ghostBri
   };
 }
-#endif
 
 void mode_touch_ripple(void) {
-#ifndef USERMOD_MPR121
+#if !defined(USERMOD_MPR121) && !defined(USERMOD_SENSOR_SYNC)
   return;
-#else
+#endif
   if (SEGLEN == 0) return;
-
-  // mpr may report no physical sensor (display-only node): the touched() wrappers then
-  // return false, so local-touch logic is inert but remote/audio waves still render.
-  UsermodMPR121 *mpr = (UsermodMPR121*) UsermodManager::lookup(USERMOD_ID_MPR121);
-  if (!mpr) return;
-
-  if (mpr->isSensorFound()) mpr->setUpdateHz(map8(SEGMENT.custom1, 1, 100));
 
   if (!SEGENV.allocateData(sizeof(TouchRippleData))) return;
   TouchRippleData *data = reinterpret_cast<TouchRippleData*>(SEGENV.data);
@@ -378,30 +378,72 @@ void mode_touch_ripple(void) {
   for (uint16_t i = 0; i < SEGLEN; i++)
     SEGMENT.setPixelColor(i, color_fade(SEGMENT.getPixelColor(i), fadeRate, false));
 
-  // Detect touched electrodes and rising edges
-  uint16_t curTouched = 0;
-  for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++)
-    if (mpr->touched(e)) curTouched |= (1u << e);
-
-  uint16_t newTouches = curTouched & ~data->prevTouched;
-  data->prevTouched = curTouched;
-
   uint8_t maxAge = map8(255 - SEGMENT.speed, 50, 200);
   uint16_t maxRadius = (uint16_t)SEGLEN;
 
-  // Record new touches to history ring buffer and spawn real waves
-  for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++) {
-    if (!(newTouches & (1u << e))) continue;
-    uint8_t delta = (uint8_t)min((uint32_t)255, (uint32_t)data->idleFrames / REPLAY_SCALE);
-    data->history[data->histHead] = {e, delta};
-    data->histHead = (data->histHead + 1) % MAX_HISTORY;
-    if (data->histCount < MAX_HISTORY) data->histCount++;
-    spawnTouchWave(data, e, SEGLEN, maxAge, 255, touchWaveColor(e));
-  }
+  // Touched-electrode bitmask this frame; stays 0 on display-only nodes (no local sensor).
+  uint16_t curTouched = 0;
+
+#ifdef USERMOD_MPR121
+  // mpr may report no physical sensor (display-only node): skip local logic entirely (do NOT
+  // return, so remote/audio waves still render), but never dereference a null lookup.
+  UsermodMPR121 *mpr = (UsermodMPR121*) UsermodManager::lookup(USERMOD_ID_MPR121);
+  if (mpr) {
+    if (mpr->isSensorFound()) mpr->setUpdateHz(map8(SEGMENT.custom1, 1, 100));
+
+    // Detect touched electrodes and rising edges
+    for (uint8_t e = 0; e < TOUCH_NCH_MAX; e++)
+      if (mpr->touched(e)) curTouched |= (1u << e);
+
+    uint16_t newTouches = curTouched & ~data->prevTouched;
+    data->prevTouched = curTouched;
+
+    // Record new touches to history ring buffer and spawn real waves
+    for (uint8_t e = 0; e < TOUCH_NCH_MAX; e++) {
+      if (!(newTouches & (1u << e))) continue;
+      uint8_t delta = (uint8_t)min((uint32_t)255, (uint32_t)data->idleFrames / REPLAY_SCALE);
+      data->history[data->histHead] = {e, delta};
+      data->histHead = (data->histHead + 1) % MAX_HISTORY;
+      if (data->histCount < MAX_HISTORY) data->histCount++;
+      spawnTouchWave(data, e, SEGLEN, maxAge, 255, touchWaveColor(e));
+    }
+
+    // Update idle counter; reset and cancel replay on any new real touch
+    if (newTouches) {
+      data->idleFrames = 0;
+      data->replayIdx = 0;
+      data->replayWait = 0;
+    } else {
+      if (data->idleFrames < 0xFFFF) data->idleFrames++;
+    }
+
+    // Idle ghost replay: replay stored touch history as dim echo waves, preserving rhythm
+    if (data->idleFrames > IDLE_THRESHOLD && data->histCount > 0) {
+      if (data->replayWait > 0) {
+        data->replayWait--;
+      } else {
+        uint8_t oldest = (data->histHead + MAX_HISTORY - data->histCount) % MAX_HISTORY;
+        uint8_t idx = (oldest + data->replayIdx) % MAX_HISTORY;
+        spawnTouchWave(data, data->history[idx].electrode, SEGLEN, maxAge, 80, touchWaveColor(data->history[idx].electrode));
+
+        uint8_t nextIdx = (data->replayIdx + 1) % data->histCount;
+        if (nextIdx == 0) {
+          data->replayWait = REPLAY_PAUSE;
+        } else {
+          uint8_t nextHistIdx = (oldest + nextIdx) % MAX_HISTORY;
+          uint16_t wait = (uint16_t)data->history[nextHistIdx].timeDelta * REPLAY_SCALE;
+          data->replayWait = (wait > 0) ? wait : 1;
+        }
+        data->replayIdx = nextIdx;
+      }
+    }
+  } // if (mpr)
+#endif // USERMOD_MPR121
 
   // Remote touches from other devices (sensor-sync usermod): spawn a wave with a distinct hue
   // (offset half the palette) so remote interaction is visibly different. This segment holds its
-  // own drain cursor, so multiple Touch Pond segments each receive every remote event.
+  // own drain cursor, so multiple Touch Pond segments each receive every remote event. Runs on
+  // display-only nodes (no local MPR121) so they still render remote waves.
 #ifdef USERMOD_SENSOR_SYNC
   {
     UsermodSensorSync *ss = (UsermodSensorSync*) UsermodManager::lookup(USERMOD_ID_SENSOR_SYNC);
@@ -411,7 +453,7 @@ void mode_touch_ripple(void) {
       uint8_t n;
       while ((n = ss->drain(data->remoteCursor, ev, 8)) > 0) {
         for (uint8_t i = 0; i < n; i++) {
-          if (ev[i].sensorType == SS_SENSOR_TOUCH && ev[i].value && ev[i].channel < MPR121::MAX_SENSORS)
+          if (ev[i].sensorType == SS_SENSOR_TOUCH && ev[i].value && ev[i].channel < TOUCH_NCH_MAX)
             spawnTouchWave(data, ev[i].channel, SEGLEN, maxAge, 255,
                            (uint8_t)(touchWaveColor(ev[i].channel) + 128));
         }
@@ -419,36 +461,6 @@ void mode_touch_ripple(void) {
     }
   }
 #endif
-
-  // Update idle counter; reset and cancel replay on any new real touch
-  if (newTouches) {
-    data->idleFrames = 0;
-    data->replayIdx = 0;
-    data->replayWait = 0;
-  } else {
-    if (data->idleFrames < 0xFFFF) data->idleFrames++;
-  }
-
-  // Idle ghost replay: replay stored touch history as dim echo waves, preserving rhythm
-  if (data->idleFrames > IDLE_THRESHOLD && data->histCount > 0) {
-    if (data->replayWait > 0) {
-      data->replayWait--;
-    } else {
-      uint8_t oldest = (data->histHead + MAX_HISTORY - data->histCount) % MAX_HISTORY;
-      uint8_t idx = (oldest + data->replayIdx) % MAX_HISTORY;
-      spawnTouchWave(data, data->history[idx].electrode, SEGLEN, maxAge, 80, touchWaveColor(data->history[idx].electrode));
-
-      uint8_t nextIdx = (data->replayIdx + 1) % data->histCount;
-      if (nextIdx == 0) {
-        data->replayWait = REPLAY_PAUSE;
-      } else {
-        uint8_t nextHistIdx = (oldest + nextIdx) % MAX_HISTORY;
-        uint16_t wait = (uint16_t)data->history[nextHistIdx].timeDelta * REPLAY_SCALE;
-        data->replayWait = (wait > 0) ? wait : 1;
-      }
-      data->replayIdx = nextIdx;
-    }
-  }
 
   // Audio-reactive wave spawning: c3 controls sensitivity (sqrt curve so half = ~70% of max)
   uint8_t audioMix = SEGMENT.custom3;
@@ -486,7 +498,7 @@ void mode_touch_ripple(void) {
       } else if (normVol > threshold) {
         // Brightness scales with amplitude: louder = brighter (80-220 range)
         uint8_t audioBri = 80 + scale8(normVol, scale8(curvedMix, 140));
-        uint8_t audioE = random8(MPR121::MAX_SENSORS);
+        uint8_t audioE = random8(TOUCH_NCH_MAX);
         spawnTouchWave(data, audioE, SEGLEN, maxAge, audioBri, touchWaveColor(audioE));
         SEGENV.aux0 = map8(255 - curvedMix, 8, 40);
       }
@@ -521,12 +533,14 @@ void mode_touch_ripple(void) {
     if (wave.age >= wave.maxAge) wave.maxAge = 0;
   }
 
-  // Held-electrode pulse: beatsin that makes the anchor glow rhythmically
+  // Held-electrode pulse: beatsin that makes the anchor glow rhythmically. Local-only —
+  // curTouched is always 0 on display-only nodes, so no held-anchor glow there.
+#ifdef USERMOD_MPR121
   uint8_t beat = beatsin8(30, 80, 220);
-  for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++) {
+  for (uint8_t e = 0; e < TOUCH_NCH_MAX; e++) {
     if (!(curTouched & (1u << e))) continue;
-    uint16_t anchor = (uint32_t)e * SEGLEN / MPR121::MAX_SENSORS;
-    uint32_t col = SEGMENT.color_from_palette(e * (256 / MPR121::MAX_SENSORS), false, false, 255);
+    uint16_t anchor = (uint32_t)e * SEGLEN / TOUCH_NCH_MAX;
+    uint32_t col = SEGMENT.color_from_palette(e * (256 / TOUCH_NCH_MAX), false, false, 255);
     uint8_t anchorBri = scale8(beat, SEGMENT.intensity >> 1);
     for (int8_t d = -1; d <= 1; d++) {
       int16_t pos = (int16_t)anchor + d;
@@ -535,8 +549,6 @@ void mode_touch_ripple(void) {
       SEGMENT.blendPixelColor((uint16_t)pos, col, taperedBri);
     }
   }
-
-  return;
 #endif
 }
 static const char _data_FX_MODE_TOUCH_RIPPLE[] PROGMEM =
@@ -628,13 +640,16 @@ void mode_touch_grid(void) {
   if (mpr) {
     if (mpr->isSensorFound()) mpr->setUpdateHz(map8(SEGMENT.custom1, 1, 100));
     uint16_t cur = 0;
-    for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++) if (mpr->touched(e)) cur |= (1u << e);
+    for (uint8_t e = 0; e < TOUCH_NCH_MAX; e++) if (mpr->touched(e)) cur |= (1u << e);
     uint16_t newTouch = cur & ~d->prevTouched;
     d->prevTouched = cur;
-    for (uint8_t e = 0; e < MPR121::MAX_SENSORS; e++)
-      if (newTouch & (1u << e)) tgSpawnChaser(d, e, MPR121::MAX_SENSORS, perim, 255, SEGMENT.speed);
+    for (uint8_t e = 0; e < TOUCH_NCH_MAX; e++)
+      if (newTouch & (1u << e)) tgSpawnChaser(d, e, TOUCH_NCH_MAX, perim, 255, SEGMENT.speed);
   }
-  #ifdef USERMOD_SENSOR_SYNC
+#endif
+
+  // Remote touches (sensor-sync bus): dimmer chasers. Runs on display-only nodes (no MPR121).
+#ifdef USERMOD_SENSOR_SYNC
   UsermodSensorSync *ss = (UsermodSensorSync*) UsermodManager::lookup(USERMOD_ID_SENSOR_SYNC);
   if (ss) {
     if (!d->remoteSubscribed) { d->remoteCursor = ss->subscribe(); d->remoteSubscribed = true; }
@@ -642,10 +657,9 @@ void mode_touch_grid(void) {
     uint8_t n;
     while ((n = ss->drain(d->remoteCursor, ev, 8)) > 0)
       for (uint8_t i = 0; i < n; i++)
-        if (ev[i].sensorType == SS_SENSOR_TOUCH && ev[i].value && ev[i].channel < MPR121::MAX_SENSORS)
-          tgSpawnChaser(d, ev[i].channel, MPR121::MAX_SENSORS, perim, 90, SEGMENT.speed);
+        if (ev[i].sensorType == SS_SENSOR_TOUCH && ev[i].value && ev[i].channel < TOUCH_NCH_MAX)
+          tgSpawnChaser(d, ev[i].channel, TOUCH_NCH_MAX, perim, 90, SEGMENT.speed);
   }
-  #endif
 #endif
 
   // --- audio reactivity (optional): livelier sparks with volume, a bright base flash on beats.
