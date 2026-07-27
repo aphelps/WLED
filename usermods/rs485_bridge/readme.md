@@ -1,0 +1,204 @@
+# RS485 Bridge (AMPWorks)
+
+Turns a WLED ESP32 into a **WiFi ↔ RS485 bridge** for legacy [HMTL](https://github.com/aphelps/HMTL)
+modules, using `RS485Socket` from [aphelps/ArduinoLibs](https://github.com/aphelps/ArduinoLibs).
+
+Two directions, both in v1:
+
+| Direction | What happens |
+|-----------|--------------|
+| **Master — WiFi → RS485** | A UDP listener (default port **21331**) accepts raw HMTL-framed datagrams, validates them, and transmits them onto the RS485 bus. |
+| **Slave — RS485 → WLED** | Frames addressed to this node (or broadcast) are parsed and acted on: colour/brightness sets, a small set of HMTL programs mapped to WLED effects, POLL and SET_ADDRESS. Frames for other nodes — and responses to forwarded commands — are relayed back to the last WiFi peer. |
+
+SensorSync-over-RS485 is **not** part of this usermod; it is the follow-up task
+`sensorsync-rs485-transport`. Sensor broadcasts seen on the bus are relayed and counted only.
+
+## Enabling it
+
+Only the `ampworks` env (and anything that extends it, e.g. `apa102_mpr121`) builds the bridge:
+
+```ini
+custom_usermods = audioreactive ampworks mpr121 rs485_bridge
+build_flags = … -D USERMOD_RS485_BRIDGE -D RS485_HARDWARE_SERIAL=2
+lib_extra_dirs = ${PROJECT_DIR}/../ArduinoLibs
+lib_deps = …
+  ${PROJECT_DIR}/../ArduinoLibs/Socket
+  ${PROJECT_DIR}/../ArduinoLibs/RS485_non_blocking
+  ${PROJECT_DIR}/../ArduinoLibs/RS485Utils
+```
+
+Both flags are load-bearing:
+
+* `USERMOD_RS485_BRIDGE` opts the usermod in.
+* `RS485_HARDWARE_SERIAL=<uart>` is what makes RS485Utils' `SERIAL_TYPE` resolve to
+  `HardwareSerial`. Without it the library falls back to AVR-only `SoftwareSerial` and the
+  build fails. (The usermod reads the *runtime* UART number from its own config; the macro
+  only selects the type.)
+
+```bash
+cd WLED && pio run -e ampworks
+```
+
+### Why the build guard exists
+
+Adding `usermods/rs485_bridge/library.json` automatically enrols this directory in two builds
+that set **none** of those flags:
+
+* `[env:usermods]` (`custom_usermods = *`), built by `.github/workflows/build.yml`
+* the per-usermod matrix in `.github/workflows/usermods.yml`
+  (`usermods_esp32` / `_esp32c3` / `_esp32s2` / `_esp32s3`)
+
+and UART 2 does not exist on ESP32-C3/S2 at all. So the whole translation unit is wrapped in
+
+```c
+#if defined(USERMOD_RS485_BRIDGE) && defined(RS485_HARDWARE_SERIAL) && defined(ARDUINO_ARCH_ESP32)
+```
+
+In those builds the bridge compiles to nothing and an **inert placeholder usermod** takes its
+place, reporting `RS485 Bridge: not built` on the info page. The placeholder is not cosmetic:
+`pio-scripts/validate_modules.py` fails the build for any enrolled usermod that contributes no
+compilation unit to the linked ELF, and a translation unit with no reachable symbol is dropped by
+`--gc-sections`. The dependency-free `rs485_bridge_protocol.h` is still compiled there, so its
+wire-layout `static_assert`s run in all four CI targets.
+
+`ArduinoLibs/RS485Utils` carries a matching guard (`RS485UTILS_SUPPORTED`) so it too compiles to
+nothing when no serial backend is available — the CI workflows put ArduinoLibs on
+`PLATFORMIO_LIB_EXTRA_DIRS`, which is enough for the library dependency finder to pull it in.
+
+## Wiring
+
+A 3.3 V-tolerant RS485 transceiver (MAX3485 / SP3485 / SN65HVD75) with a single driver-enable
+line:
+
+| Transceiver | ESP32 (default) | Notes |
+|-------------|-----------------|-------|
+| `RO` (receiver out)  | GPIO 16 → UART RX | |
+| `DI` (driver in)     | GPIO 17 ← UART TX | |
+| `DE` + `/RE` (tied)  | GPIO 18           | HIGH while transmitting |
+| `A` / `B`            | bus pair          | 120 Ω termination at both ends of the run |
+| `VCC` / `GND`        | 3.3 V / GND       | share GND with every node on the bus |
+
+> **⚠ GPIO 16/17 fail on PSRAM boards.** `PinManager::isPinOk()` returns `!psramFound()` for
+> GPIO 16 and 17 (`wled00/pin_manager.cpp`) because those are the WROVER PSRAM pins. On any
+> board with PSRAM the default pins will fail allocation and the bridge will stay disabled with
+> `error: pin not usable` on the info page — pick different pins in the settings.
+
+Pins are registered with WLED's `PinManager` under `PinOwner::UM_RS485_BRIDGE`, so the LED-bus /
+button / relay settings pages report a conflict instead of silently fighting over them.
+Allocation is all-or-nothing: if any of the three pins is unavailable the UART is never opened.
+
+## Settings (Config → Usermods → RS485Bridge)
+
+| Field | Key | Default | Notes |
+|-------|-----|---------|-------|
+| Enabled | `enabled` | `false` | Off unless explicitly enabled. |
+| UART | `uart` | `2` | 1 or 2 (UART 0 is the serial console). **Reboot required.** |
+| RX pin | `rx` | `16` | **Reboot required.** |
+| TX pin | `tx` | `17` | **Reboot required.** |
+| DE/RE pin | `en` | `18` | **Reboot required.** |
+| Baud | `baud` | `28000` | `RS485Socket::DEFAULT_BAUD` — what existing HMTL modules use. **Reboot required.** |
+| RS485 address | `addr` | `1` | This node's HMTL/socket address. Applied live. |
+| Device id | `devId` | `0` | HMTL device id; `0` derives one from the MAC. |
+| UDP port | `port` | `21331` | WiFi ingress port. Applied live (rebinds). |
+
+**Why "reboot required".** `RS485Utils` keeps its serial pointer in a file-scope global and
+`RS485Socket::init_general()` unconditionally re-runs `new RS485(...)` without freeing the
+previous channel or `HardwareSerial`, so re-`init()`ing after a settings change leaks. `setup()`
+is therefore the only caller of `HardwareSerial::begin()` and `RS485Socket::init()`. The RS485
+address is the exception — it lives in `RS485Socket::sourceAddress` and is safe to change live,
+which is what makes HMTL `SET_ADDRESS` work.
+
+Verify a config round-trip with:
+
+```bash
+curl -s http://<ip>/json/cfg | python3 -m json.tool | grep -A9 RS485Bridge
+```
+
+## HMTL command subset (v1)
+
+Everything below is accepted when the frame's destination address is this node's address or the
+broadcast address `0xFFFF`.
+
+| HMTL message | Payload | Effect on WLED |
+|--------------|---------|----------------|
+| `MSG_TYPE_OUTPUT` / `HMTL_OUTPUT_RGB` | `msg_rgb_t` | Main segment colour 0 ← RGB, effect forced to `FX_MODE_STATIC`. |
+| `MSG_TYPE_OUTPUT` / `HMTL_OUTPUT_VALUE` | `msg_value_t` | Master brightness ← value (13-bit field clamped to 255). HMTL drives all three channels from this field, i.e. a white level. |
+| `MSG_TYPE_OUTPUT` / `HMTL_OUTPUT_PROGRAM` or `_PIXELS` | `msg_program_t` | See the program map below. |
+| `MSG_TYPE_POLL` | — | Answers with an HMTL poll response (config v3 header, `object_type` `0x57`, `recv_buffer_size` 64) addressed to the sender. |
+| `MSG_TYPE_SET_ADDR` | `msg_set_addr_t` | Adopts the new address if `device_id` is 0 ("any device") or matches this node's device id; persists it to `cfg.json`. |
+| `MSG_TYPE_SENSOR` | `msg_sensor_data_t` records | Relayed to the WiFi peer and counted. Local handling is the `sensorsync-rs485-transport` follow-up. |
+
+### Program → effect map
+
+| HMTL program | Value | WLED effect |
+|--------------|-------|-------------|
+| `HMTL_PROGRAM_NONE` | `0x00` | `FX_MODE_STATIC` (0) |
+| `HMTL_PROGRAM_BLINK` | `0x01` | `FX_MODE_BLINK` (1) |
+| `HMTL_PROGRAM_FADE` | `0x05` | `FX_MODE_FADE` (12) |
+| `HMTL_PROGRAM_SPARKLE` | `0x06` | `FX_MODE_SPARKLE` (20) |
+| `HMTL_PROGRAM_CIRCULAR` | `0x08` | `FX_MODE_CHASE_COLOR` (28) |
+| `PROGRAM_BRIGHTNESS` | `0x30` | Master brightness ← `values[0]` (one-shot, no mode change) |
+| `PROGRAM_COLOR` | `0x31` | Main segment colour 0 ← `values[0..2]` (one-shot, no mode change) |
+
+`TIMED_CHANGE`, `LEVEL_VALUE`, `SOUND_VALUE`, `SOUND_PIXELS` and `SEQUENCE` have **no** v1
+mapping: they are counted as `unsupported` and ignored. Deeper effect mapping is future work —
+the transport is the deliverable here.
+
+Anything else addressed to this node (unknown message types, unknown output types, truncated
+payloads) is counted and ignored; nothing is ever dereferenced past the validated frame length.
+
+## Bridge semantics
+
+* **Validation.** Every frame is checked for start code `0xFC`, protocol version 2, a
+  `length` between the 8-byte header and `HMTL_MAX_MSG_LEN`, enough bytes actually present, and
+  the CRC. A **zero CRC is accepted unchecked** — stock HMTL builds have `HMTL_USE_CRC`
+  commented out and transmit `crc == 0`. A non-zero CRC must match (CRC-8, poly `0xD8`, init 0,
+  computed over the whole message with the CRC byte treated as zero).
+* **Socket-level bounds.** `RS485Utils`' own length checks live inside
+  `#if DEBUG_LEVEL >= DEBUG_TRACE` and are compiled out of release builds, so the usermod
+  re-checks `getLength()` against the socket header + payload length itself before touching the
+  payload.
+* **Transmit is rate-bounded.** `RS485Socket::sendMsgTo` blocks: it calls `serial->flush()` while
+  holding DE high, so a 64-byte payload at 28000 baud is ≈48 ms of busy-wait once Gammon's
+  byte-stuffing is counted. The bridge therefore transmits **at most one frame per `loop()`
+  iteration** and parks the rest in a 4-slot ring buffer, dropping the oldest on overflow. A UDP
+  flood cannot stall the LED refresh or trip the watchdog.
+* **Ingress size cap.** A datagram whose declared `length` exceeds the socket data buffer (64 B)
+  is rejected before it reaches `sendMsgTo`, whose `datalength` argument is a `byte` and which
+  writes the socket header *in front of* the caller's buffer.
+* **Relay target.** Responses and non-local traffic go to the IP/port of the most recent WiFi
+  datagram. There is no peer table in v1.
+
+## Info page counters
+
+`Info → RS485 Bridge` shows the address (or `disabled` / `not built` / `error: <reason>`), then
+`RS485 rx/tx`, `RS485 udp in/relayed`, and — only when non-zero — `RS485 dropped` broken down
+into bad frames, unsupported commands, transmit-queue drops and rejected datagrams.
+
+## Testing
+
+Pure protocol/decision logic is host-testable with no Arduino toolchain:
+
+```bash
+c++ -std=c++11 -Wall -Wextra -o /tmp/rs485_test usermods/rs485_bridge/tests/rs485_bridge_test.cpp \
+  && /tmp/rs485_test
+```
+
+`tests/` is excluded from the firmware build via `library.json`'s `srcFilter`.
+
+## Files
+
+| File | Role |
+|------|------|
+| `rs485_bridge_protocol.h` | HMTL wire format, CRC-8, frame validation, the bridge decision function, the transmit ring buffer and the counters. **No WLED/Arduino dependencies** — host unit-tested. |
+| `usermod_rs485_bridge.h` | Usermod class + the `RS485_BRIDGE_BUILD` guard. |
+| `usermod_rs485_bridge.cpp` | Transport wiring (HardwareSerial + RS485Socket + WiFiUDP), segment/brightness actions, config, and the inert placeholder for flagless builds. |
+| `tests/rs485_bridge_test.cpp` | Host unit test. |
+
+### Relationship to the HMTL submodule
+
+`HMTL/` (super-repo root) is the source of truth for the wire format but is **deliberately not on
+the PlatformIO build path**: `HMTLTypes.cpp` pulls in `Debug.h`, `EEPromUtils.h`, `PixelUtil.h`,
+`MPR121.h` and `XBeeSocket.h`, and `HMTLMessaging.cpp` pulls in `HMTLPrograms.h` → `FastLED.h`,
+which WLED 16 removed. Only the framing is copied, into `rs485_bridge_protocol.h`. Keep the two
+in sync — the `static_assert`s at the bottom of that header catch layout drift, not renames.

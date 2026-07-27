@@ -1,0 +1,7 @@
+{
+  "name": "rs485_bridge",
+  "build": {
+    "libArchive": false,
+    "srcFilter": ["+<*>", "-<tests/>"]
+  }
+}
