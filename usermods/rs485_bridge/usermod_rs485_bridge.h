@@ -70,6 +70,7 @@ class UsermodRS485Bridge : public Usermod {
   // Per-iteration service of both directions; see the .cpp for the rate-limiting rationale.
   void loop() override;
 
+  // Usermod id (USERMOD_ID_RS485_BRIDGE) — what UsermodManager::lookup() finds this bridge by.
   uint16_t getId() override { return USERMOD_ID_RS485_BRIDGE; }
   // Publish state + counters into /json/info.
   void addToJsonInfo(JsonObject &root) override;

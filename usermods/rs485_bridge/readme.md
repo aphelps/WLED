@@ -58,8 +58,9 @@ In those builds the bridge compiles to nothing and an **inert placeholder usermo
 place, reporting `RS485 Bridge: not built` on the info page. The placeholder is not cosmetic:
 `pio-scripts/validate_modules.py` fails the build for any enrolled usermod that contributes no
 compilation unit to the linked ELF, and a translation unit with no reachable symbol is dropped by
-`--gc-sections`. The dependency-free `rs485_bridge_protocol.h` is still compiled there, so its
-wire-layout `static_assert`s run in all four CI targets.
+`--gc-sections`. `rs485_bridge_protocol.h` is *not* compiled there — it imports the wire format
+from the HMTL submodule, which is only on the build path in the RS485-enabled env — so its
+wire-layout `static_assert`s are covered by `pio run -e ampworks` and by the host test instead.
 
 `ArduinoLibs/RS485Utils` carries a matching guard (`RS485UTILS_SUPPORTED`) so it too compiles to
 nothing when no serial backend is available — the CI workflows put ArduinoLibs on
@@ -190,15 +191,37 @@ c++ -std=c++11 -Wall -Wextra -o /tmp/rs485_test usermods/rs485_bridge/tests/rs48
 
 | File | Role |
 |------|------|
-| `rs485_bridge_protocol.h` | HMTL wire format, CRC-8, frame validation, the bridge decision function, the transmit ring buffer and the counters. **No WLED/Arduino dependencies** — host unit-tested. |
+| `rs485_bridge_protocol.h` | CRC-8, frame validation, the bridge decision function, the transmit ring buffer and the counters. Imports the wire format from HMTL (below). **No WLED/Arduino dependencies** — host unit-tested. |
 | `usermod_rs485_bridge.h` | Usermod class + the `RS485_BRIDGE_BUILD` guard. |
 | `usermod_rs485_bridge.cpp` | Transport wiring (HardwareSerial + RS485Socket + WiFiUDP), segment/brightness actions, config, and the inert placeholder for flagless builds. |
 | `tests/rs485_bridge_test.cpp` | Host unit test. |
 
 ### Relationship to the HMTL submodule
 
-`HMTL/` (super-repo root) is the source of truth for the wire format but is **deliberately not on
-the PlatformIO build path**: `HMTLTypes.cpp` pulls in `Debug.h`, `EEPromUtils.h`, `PixelUtil.h`,
-`MPR121.h` and `XBeeSocket.h`, and `HMTLMessaging.cpp` pulls in `HMTLPrograms.h` → `FastLED.h`,
-which WLED 16 removed. Only the framing is copied, into `rs485_bridge_protocol.h`. Keep the two
-in sync — the `static_assert`s at the bottom of that header catch layout drift, not renames.
+`HMTL/` (super-repo root) is the source of truth for the wire format, and the bridge **imports**
+it rather than copying it: `rs485_bridge_protocol.h` includes
+`HMTL/Libraries/HMTLprotocol/HMTLWireFormat.h` for `msg_hdr_t`, the `MSG_TYPE_*` / `MSG_FLAG_*`
+codes, the `msg_*` payload structs, `output_hdr_t`, `config_hdr_t` and the `HMTL_OUTPUT_*` /
+`HMTL_PROGRAM_*` codes. There is no second copy to keep in sync.
+
+`HMTLWireFormat.h` was extracted upstream for exactly this purpose (aphelps/HMTL, branch
+`rs485-bridge-wire-format`): it takes only `<stdint.h>` and `Socket.h`, never `Arduino.h` or
+`RS485Utils.h`, which is why the host unit test can compile it with a plain `c++`. The rest of
+HMTL stays off the build path — `HMTLTypes.cpp` pulls in `Debug.h`, `EEPromUtils.h`,
+`PixelUtil.h`, `MPR121.h` and `XBeeSocket.h`, and `HMTLMessaging.cpp` pulls in `HMTLPrograms.h`
+→ `FastLED.h`, which WLED 16 removed — so nothing here includes `HMTLTypes.h` or
+`HMTLMessaging.h`.
+
+Two things remain bridge-local by necessity rather than by choice, both reimplementations of
+*algorithms* (never of declarations), and both pinned by the host test:
+
+* `rs485b_crc8()` — ArduinoLibs' `EEPROM_crc` lives in `EEPromUtils.cpp` behind AVR-only
+  `EEPROM.h` and is not inline, so it cannot be linked from either the ESP32 firmware or the host
+  test.
+* `rs485b_hmtl_fmt()` / `rs485b_next_sensor()` — the HMTL equivalents (`hmtl_msg_fmt`,
+  `hmtl_next_sensor`) live in `HMTLMessaging.cpp`, behind `Debug.h` and `FastLED.h`.
+
+Build wiring: `${PROJECT_DIR}/../HMTL/Libraries` on `lib_extra_dirs` plus
+`${PROJECT_DIR}/../HMTL/Libraries/HMTLprotocol` in `lib_deps` (`[env:ampworks]`). `HMTLprotocol`
+carries a `library.json` declaring `espressif32`, which WLED's `lib_compat_mode = strict`
+requires.

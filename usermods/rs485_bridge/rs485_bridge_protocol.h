@@ -1,26 +1,32 @@
 #pragma once
 //
-// rs485_bridge_protocol.h — the HMTL wire format + the pure bridge decision logic.
+// rs485_bridge_protocol.h — the pure bridge/framing logic that sits on top of the HMTL wire
+// format.
 //
-// This header is deliberately free of any WLED / Arduino / ArduinoLibs dependencies (only
-// <stdint.h> / <string.h>), so it compiles and unit-tests on a host build. The Arduino usermod
-// (usermod_rs485_bridge.{h,cpp}) includes this and wires it to RS485Socket + WiFiUDP + the
-// segment layer; the host test (tests/rs485_bridge_test.cpp) includes only this file.
+// This header is deliberately free of any WLED / Arduino / ArduinoLibs-transport dependencies, so
+// it compiles and unit-tests on a host build. The Arduino usermod (usermod_rs485_bridge.{h,cpp})
+// includes this and wires it to RS485Socket + WiFiUDP + the segment layer; the host test
+// (tests/rs485_bridge_test.cpp) includes only this file.
 //
 // ---------------------------------------------------------------------------------------------
-// Why the wire format is vendored instead of #included from the HMTL submodule
+// Where the wire format comes from
 // ---------------------------------------------------------------------------------------------
-// The HMTL submodule (../../../HMTL) is the source of truth for this format, but its libraries
-// are not buildable inside WLED 16: HMTLTypes.cpp pulls in Debug.h / EEPromUtils.h / PixelUtil.h /
-// MPR121.h / XBeeSocket.h, and HMTLMessaging.cpp pulls in HMTLPrograms.h -> FastLED.h (removed in
-// WLED 16). Only the *wire format* is needed here, so it is copied — keep it byte-compatible with:
-//   HMTL/Libraries/HMTLMessaging/HMTLMessaging.h   (msg_hdr_t and the msg_* payload structs)
-//   HMTL/Libraries/HMTLTypes/HMTLTypes.h           (output_hdr_t, HMTL_OUTPUT_*, HMTL_NO_ADDRESS)
-//   HMTL/Libraries/HMTLMessaging/HMTLPrograms.h    (HMTL_PROGRAM_*)
-//   ArduinoLibs/EEPromUtils/EEPromUtils.cpp:32     (the CRC-8 polynomial)
+// It is IMPORTED, not copied: HMTLWireFormat.h in the HMTL submodule
+// (../../../HMTL/Libraries/HMTLprotocol/, on the build path via lib_extra_dirs) is the single
+// source of truth for msg_hdr_t, the MSG_TYPE_* / MSG_FLAG_* codes, the msg_* payload structs,
+// output_hdr_t, config_hdr_t and the HMTL_OUTPUT_* / HMTL_PROGRAM_* codes. That header was
+// extracted upstream (aphelps/HMTL, branch rs485-bridge-wire-format) precisely so consumers like
+// this one do not have to vendor the declarations: it pulls in only <stdint.h> and Socket.h and
+// never Arduino.h, which is why the host test below still builds with a plain host compiler.
+//
+// Everything defined *here* is bridge-specific and has no HMTL equivalent: the RS485-socket
+// bounds constants, the CRC helper, frame validation, the pure receive-path decision function,
+// the transmit queue and the counters.
 //
 #include <stdint.h>
 #include <string.h>
+
+#include "HMTLWireFormat.h"   // HMTL submodule — the wire format, imported (see above)
 
 // ---------------------------------------------------------------------------------------------
 // RS485 socket layer (mirrors ArduinoLibs RS485Utils' rs485_socket_hdr_t) — size math only.
@@ -28,64 +34,14 @@
 // { byte ID; byte length; uint16_t source; uint16_t address; byte flags; } with natural
 // alignment == 8 bytes. Used to bounds-check RS485Socket::getLength() against the payload
 // length before dereferencing (RS485Utils' own checks are compiled out in release builds:
-// they sit inside `#if DEBUG_LEVEL >= DEBUG_TRACE`).
+// they sit inside `#if DEBUG_LEVEL >= DEBUG_TRACE`). Declared as a literal rather than taken from
+// RS485Utils.h because that header pulls in Arduino.h; usermod_rs485_bridge.cpp static_asserts it
+// against the real struct.
 #define RS485B_SOCKET_HDR_LEN 8
 
-// ---------------------------------------------------------------------------------------------
-// HMTL message framing
-// ---------------------------------------------------------------------------------------------
-#define HMTL_MSG_START    0xFC
-#define HMTL_MSG_VERSION  2
-#define HMTL_MAX_MSG_LEN  128
-
-// Message type codes (msg_hdr_t.type)
-#define HMTL_MSG_TYPE_OUTPUT      0x01
-#define HMTL_MSG_TYPE_POLL        0x02
-#define HMTL_MSG_TYPE_SET_ADDR    0x03
-#define HMTL_MSG_TYPE_SENSOR      0x04
-#define HMTL_MSG_TYPE_TIMESYNC    0x05
-#define HMTL_MSG_TYPE_DUMP_CONFIG 0xE0
-
-// Message flags (msg_hdr_t.flags)
-#define HMTL_MSG_FLAG_ACK       (1 << 0)
-#define HMTL_MSG_FLAG_RESPONSE  (1 << 1)   // sender expects a response
-#define HMTL_MSG_FLAG_MORE_DATA (1 << 2)
-#define HMTL_MSG_FLAG_ERROR     (1 << 3)
-
-// Output types (output_hdr_t.type)
-#define HMTL_OUTPUT_VALUE   0x1
-#define HMTL_OUTPUT_RGB     0x2
-#define HMTL_OUTPUT_PROGRAM 0x3
-#define HMTL_OUTPUT_PIXELS  0x4
-#define HMTL_OUTPUT_MPR121  0x5
-#define HMTL_OUTPUT_RS485   0x6
-#define HMTL_OUTPUT_XBEE    0x7
-
-#define HMTL_NO_OUTPUT      ((uint8_t)-1)   // 0xFF
-#define HMTL_ALL_OUTPUTS    ((uint8_t)-2)   // 0xFE
-
-// Addresses. SOCKET_ADDR_ANY (0xFFFF) doubles as HMTL's broadcast / "no address".
-#define HMTL_ADDR_BROADCAST ((uint16_t)0xFFFF)
-#define HMTL_ADDR_INVALID   ((uint16_t)0xFFFE)
-
-// HMTL programs (HMTLPrograms.h)
-#define HMTL_PROGRAM_NONE         0x00
-#define HMTL_PROGRAM_BLINK        0x01
-#define HMTL_PROGRAM_TIMED_CHANGE 0x02
-#define HMTL_PROGRAM_LEVEL_VALUE  0x03
-#define HMTL_PROGRAM_SOUND_VALUE  0x04
-#define HMTL_PROGRAM_FADE         0x05
-#define HMTL_PROGRAM_SPARKLE      0x06
-#define HMTL_PROGRAM_SOUND_PIXELS 0x07
-#define HMTL_PROGRAM_CIRCULAR     0x08
-#define HMTL_PROGRAM_SEQUENCE     0x09
-#define HMTL_PROGRAM_BRIGHTNESS   0x30   // one-shot: set brightness, no mode change
-#define HMTL_PROGRAM_COLOR        0x31   // one-shot: set colour, no mode change
-
-// Sensor types carried by HMTL_MSG_TYPE_SENSOR
-#define HMTL_SENSOR_SOUND 0x1
-#define HMTL_SENSOR_LIGHT 0x2
-#define HMTL_SENSOR_POT   0x3
+// The object type this bridge reports in a POLL response. Not a stock HMTL object type — it is
+// how a master tells a WLED bridge apart from a real HMTL module.
+#define HMTL_OBJECT_TYPE_WLED 0x57   // 'W'
 
 // The WLED effect ids this bridge maps HMTL programs onto. Duplicated as literals so this
 // header stays dependency-free; usermod_rs485_bridge.cpp static_asserts them against FX.h.
@@ -95,83 +51,13 @@
 #define RS485B_WLED_MODE_SPARKLE 20   // FX_MODE_SPARKLE
 #define RS485B_WLED_MODE_CHASE   28   // FX_MODE_CHASE_COLOR
 
-// 8 bytes: 6 x uint8_t then a naturally-aligned uint16_t. Matches HMTL's msg_hdr_t on both AVR
-// and Xtensa; `packed` makes that explicit rather than assumed.
-struct __attribute__((packed)) HmtlMsgHdr {
-  uint8_t  startcode;  // HMTL_MSG_START
-  uint8_t  crc;        // CRC-8 over the whole message with this field zeroed; 0 == "not used"
-  uint8_t  version;    // HMTL_MSG_VERSION
-  uint8_t  length;     // TOTAL message length, header included
-  uint8_t  type;       // HMTL_MSG_TYPE_*
-  uint8_t  flags;      // HMTL_MSG_FLAG_*
-  uint16_t address;    // destination (HMTL_ADDR_BROADCAST == everyone)
-};
-
-struct __attribute__((packed)) HmtlOutputHdr {
-  uint8_t type;        // HMTL_OUTPUT_*
-  uint8_t output;      // output index, or HMTL_ALL_OUTPUTS
-};
-
-// HMTL's msg_value_t. The 13/3 bit split is little-endian bitfield allocation — value occupies
-// the low 13 bits of the uint16_t. Both AVR-GCC and Xtensa-GCC lay it out that way, which is why
-// this can be a bitfield at all rather than hand-shifted; the static_assert at the bottom of this
-// header pins the resulting size.
-struct __attribute__((packed)) HmtlMsgValue {
-  HmtlOutputHdr hdr;
-  uint16_t      value : 13;   // 0..8191 — HMTL's "level"; the bridge clamps it to 8 bits
-  uint16_t      flags : 3;
-};
-
-struct __attribute__((packed)) HmtlMsgRgb {
-  HmtlOutputHdr hdr;
-  uint8_t       values[3];
-};
-
-#define HMTL_MAX_PROGRAM_VAL 32
-struct __attribute__((packed)) HmtlMsgProgram {
-  HmtlOutputHdr hdr;
-  uint8_t       type;                        // HMTL_PROGRAM_*
-  uint8_t       values[HMTL_MAX_PROGRAM_VAL];
-};
-
-struct __attribute__((packed)) HmtlMsgSetAddr {
-  uint16_t device_id;  // 0 == "any device"; otherwise only that device id reacts
-  uint16_t address;    // the new RS485 socket address
-};
-
-struct __attribute__((packed)) HmtlSensorData {
-  uint8_t sensor_type; // HMTL_SENSOR_*
-  uint8_t data_len;
-  // uint8_t data[data_len] follows
-};
-
-// Poll response payload (HMTL config_hdr_v3_t + poll fields). Emitted, never consumed.
-struct __attribute__((packed)) HmtlConfigHdrV3 {
-  uint8_t  magic;             // HMTL_CONFIG_MAGIC
-  uint8_t  protocol_version;  // HMTL_CONFIG_VERSION
-  uint8_t  hardware_version;
-  uint8_t  baud;              // baud / 1200
-  uint8_t  num_outputs;
-  uint8_t  flags;
-  uint16_t device_id;
-  uint16_t address;
-};
-
-struct __attribute__((packed)) HmtlMsgPollResponse {
-  HmtlConfigHdrV3 config;
-  uint16_t        object_type;
-  uint16_t        recv_buffer_size;
-  uint8_t         msg_version;
-};
-
-#define HMTL_CONFIG_MAGIC        0x5C
-#define HMTL_CONFIG_VERSION      3
-#define HMTL_BAUD_TO_BYTE(b)     ((uint8_t)((b) / 1200))
-#define HMTL_OBJECT_TYPE_WLED    0x57   // 'W' — not a stock HMTL object type; identifies this bridge
-
 // ---------------------------------------------------------------------------------------------
 // CRC-8 (poly 0xD8, init 0, MSB-first) — ArduinoLibs' EEPROM_crc, which HMTL uses for msg_hdr.crc
 // ---------------------------------------------------------------------------------------------
+// Reimplemented here rather than imported because ArduinoLibs' EEPROM_crc lives in
+// EEPromUtils.cpp behind EEPROM.h (AVR-only) and is not inline, so neither the ESP32 firmware nor
+// the host test can link against it. The algorithm — not a declaration — is what is duplicated,
+// and the test below pins it against an independently written reference loop.
 
 // Compute the raw CRC-8 of `len` bytes at `data`.
 //
@@ -198,7 +84,7 @@ static inline uint8_t rs485b_crc8(const uint8_t *data, uint16_t len) {
 
 // Compute the CRC of a whole HMTL message the way the sender does it.
 //
-// The crc byte lives *inside* the region being checksummed (HmtlMsgHdr::crc, offset 1), so the
+// The crc byte lives *inside* the region being checksummed (msg_hdr_t::crc, offset 1), so the
 // sender computes the CRC with that byte held at zero and only then writes the result into it.
 // Substituting a zero for offset 1 here — rather than checksumming the buffer as-is — is what
 // makes the operation idempotent: stamping a frame and re-running this function returns the same
@@ -209,7 +95,7 @@ static inline uint8_t rs485b_crc8(const uint8_t *data, uint16_t len) {
 static inline uint8_t rs485b_hmtl_crc(const uint8_t *msg, uint8_t len) {
   uint8_t remainder = 0;
   for (uint8_t i = 0; i < len; i++) {
-    uint8_t b = (i == 1) ? 0 : msg[i];   // offset 1 == HmtlMsgHdr::crc, treated as zero
+    uint8_t b = (i == 1) ? 0 : msg[i];   // offset 1 == msg_hdr_t::crc, treated as zero
     remainder ^= b;
     for (uint8_t bit = 8; bit > 0; bit--) {
       if (remainder & 0x80) remainder = (uint8_t)((remainder << 1) ^ 0xD8);
@@ -223,12 +109,15 @@ static inline uint8_t rs485b_hmtl_crc(const uint8_t *msg, uint8_t len) {
 //
 //   buf     — destination, must already hold the payload bytes that follow the header
 //   bufSize — capacity of `buf`, checked so a caller cannot overflow it via `length`
-//   address — destination address (HMTL_ADDR_BROADCAST for everyone)
+//   address — destination address (SOCKET_ADDR_ANY for everyone)
 //   length  — TOTAL frame length, header included (this is what hdr.length carries)
-//   type    — HMTL_MSG_TYPE_*
-//   flags   — HMTL_MSG_FLAG_*
+//   type    — MSG_TYPE_*
+//   flags   — MSG_FLAG_*
 //
 // Returns `length` on success, or 0 if `length` is smaller than a header or larger than `buf`.
+//
+// This is the host-testable equivalent of HMTL's hmtl_msg_fmt(), which cannot be linked here: it
+// lives in HMTLMessaging.cpp behind Debug.h and HMTLPrograms.h -> FastLED.h.
 //
 // The CRC covers the payload as well as the header, so the payload must be in place *before*
 // calling this. A caller that fills the payload afterwards has to re-stamp buf[1] itself — see
@@ -237,8 +126,8 @@ static inline uint8_t rs485b_hmtl_fmt(uint8_t *buf, uint16_t bufSize, uint16_t a
                                       uint8_t length, uint8_t type, uint8_t flags) {
   // Reject both under- and over-sized requests: `length` goes on the wire as the authoritative
   // frame size, so it must describe a real header and must fit the buffer we are writing.
-  if (length < sizeof(HmtlMsgHdr) || bufSize < length) return 0;
-  HmtlMsgHdr h;
+  if (length < sizeof(msg_hdr_t) || bufSize < length) return 0;
+  msg_hdr_t h;
   h.startcode = HMTL_MSG_START;
   h.crc       = 0;                     // zero while the CRC is computed; filled in below
   h.version   = HMTL_MSG_VERSION;
@@ -281,14 +170,14 @@ enum RS485BFrameResult : uint8_t {
 // HMTL builds, so legacy modules transmit crc == 0 (HMTLMessaging.cpp:245) and rejecting those
 // would make the bridge unable to talk to the hardware it exists for. A non-zero crc must match.
 static inline RS485BFrameResult rs485b_validate(const uint8_t *buf, uint16_t avail) {
-  if (buf == nullptr || avail < sizeof(HmtlMsgHdr)) return RS485B_ERR_SHORT;
-  HmtlMsgHdr h;
+  if (buf == nullptr || avail < sizeof(msg_hdr_t)) return RS485B_ERR_SHORT;
+  msg_hdr_t h;
   memcpy(&h, buf, sizeof(h));          // copy out: `buf` has no alignment guarantee
   if (h.startcode != HMTL_MSG_START)  return RS485B_ERR_START;
   if (h.version   != HMTL_MSG_VERSION) return RS485B_ERR_VERSION;
   // A length below the header or above the protocol maximum is either corruption or a hostile
   // frame; either way it must not become a read bound.
-  if (h.length < sizeof(HmtlMsgHdr) || h.length > HMTL_MAX_MSG_LEN) return RS485B_ERR_LENGTH;
+  if (h.length < sizeof(msg_hdr_t) || h.length > HMTL_MAX_MSG_LEN) return RS485B_ERR_LENGTH;
   if (avail < h.length) return RS485B_ERR_SHORT;   // declared more than it delivered
   if (h.crc != 0 && h.crc != rs485b_hmtl_crc(buf, h.length)) return RS485B_ERR_CRC;
   return RS485B_OK;
@@ -316,16 +205,16 @@ static inline RS485BFrameResult rs485b_validate_udp_ingress(const uint8_t *buf, 
   RS485BFrameResult r = rs485b_validate(buf, len);
   if (r != RS485B_OK) return r;
   // Safe to read: rs485b_validate() has already established that a full header is present.
-  uint8_t frameLen = buf[3];   // HmtlMsgHdr::length
+  uint8_t frameLen = buf[3];   // msg_hdr_t::length
   if (frameLen > maxPayload || frameLen > 255) return RS485B_ERR_OVERSIZE;
   return RS485B_OK;
 }
 
 // Is a message with destination `msgAddr` meant for a node listening on `selfAddr`?
 // HMTL has no subnet or group concept — a frame is either a unicast to one address or the
-// 0xFFFF broadcast every node acts on.
+// SOCKET_ADDR_ANY (0xFFFF) broadcast every node acts on.
 static inline bool rs485b_addressed_to(uint16_t msgAddr, uint16_t selfAddr) {
-  return msgAddr == HMTL_ADDR_BROADCAST || msgAddr == selfAddr;
+  return msgAddr == SOCKET_ADDR_ANY || msgAddr == selfAddr;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -387,38 +276,38 @@ static inline RS485BDecision rs485b_decide(const uint8_t *buf, uint16_t avail,
   d.err = rs485b_validate(buf, avail);
   if (d.err != RS485B_OK) { d.action = RS485B_ACT_DROP; return d; }
 
-  HmtlMsgHdr h;
+  msg_hdr_t h;
   memcpy(&h, buf, sizeof(h));
   d.destAddress   = h.address;
-  d.wantsResponse = (h.flags & HMTL_MSG_FLAG_RESPONSE) != 0;
+  d.wantsResponse = (h.flags & MSG_FLAG_RESPONSE) != 0;
 
   // Frames for other nodes are not errors — the bridge listens promiscuously (RS485_ADDR_ANY) so
   // it can mirror the whole bus back to the WiFi peer. They just get no local handling.
   if (!rs485b_addressed_to(h.address, selfAddr)) { d.action = RS485B_ACT_RELAY_ONLY; return d; }
 
-  const uint8_t *payload    = buf + sizeof(HmtlMsgHdr);
-  // Safe subtraction: validate() guaranteed h.length >= sizeof(HmtlMsgHdr).
-  const uint8_t  payloadLen = (uint8_t)(h.length - sizeof(HmtlMsgHdr));
+  const uint8_t *payload    = buf + sizeof(msg_hdr_t);
+  // Safe subtraction: validate() guaranteed h.length >= sizeof(msg_hdr_t).
+  const uint8_t  payloadLen = (uint8_t)(h.length - sizeof(msg_hdr_t));
 
   switch (h.type) {
-    case HMTL_MSG_TYPE_OUTPUT: {
+    case MSG_TYPE_OUTPUT: {
       // An OUTPUT message starts with an output header naming the target output and its type.
-      if (payloadLen < sizeof(HmtlOutputHdr)) { d.action = RS485B_ACT_UNSUPPORTED; return d; }
-      HmtlOutputHdr oh;
+      if (payloadLen < sizeof(output_hdr_t)) { d.action = RS485B_ACT_UNSUPPORTED; return d; }
+      output_hdr_t oh;
       memcpy(&oh, payload, sizeof(oh));
       d.output = oh.output;            // index, or HMTL_ALL_OUTPUTS; the bridge has one output
       switch (oh.type) {
         case HMTL_OUTPUT_RGB: {
-          if (payloadLen < sizeof(HmtlMsgRgb)) { d.action = RS485B_ACT_UNSUPPORTED; return d; }
-          HmtlMsgRgb m;
+          if (payloadLen < sizeof(msg_rgb_t)) { d.action = RS485B_ACT_UNSUPPORTED; return d; }
+          msg_rgb_t m;
           memcpy(&m, payload, sizeof(m));
           d.rgb[0] = m.values[0]; d.rgb[1] = m.values[1]; d.rgb[2] = m.values[2];
           d.action = RS485B_ACT_SET_RGB;
           return d;
         }
         case HMTL_OUTPUT_VALUE: {
-          if (payloadLen < sizeof(HmtlMsgValue)) { d.action = RS485B_ACT_UNSUPPORTED; return d; }
-          HmtlMsgValue m;
+          if (payloadLen < sizeof(msg_value_t)) { d.action = RS485B_ACT_UNSUPPORTED; return d; }
+          msg_value_t m;
           memcpy(&m, payload, sizeof(m));
           d.value  = m.value;          // 13-bit bitfield; widened to uint16_t here
           d.action = RS485B_ACT_SET_VALUE;
@@ -428,10 +317,10 @@ static inline RS485BDecision rs485b_decide(const uint8_t *buf, uint16_t avail,
         case HMTL_OUTPUT_PIXELS: {
           // msg_program_t is a fixed 35 bytes on the wire, but senders may truncate the unused
           // tail; only the output header + program type byte are required.
-          if (payloadLen < sizeof(HmtlOutputHdr) + 1) { d.action = RS485B_ACT_UNSUPPORTED; return d; }
-          d.programType = payload[sizeof(HmtlOutputHdr)];
-          d.programVals = payload + sizeof(HmtlOutputHdr) + 1;
-          d.programLen  = (uint8_t)(payloadLen - sizeof(HmtlOutputHdr) - 1);
+          if (payloadLen < sizeof(output_hdr_t) + 1) { d.action = RS485B_ACT_UNSUPPORTED; return d; }
+          d.programType = payload[sizeof(output_hdr_t)];
+          d.programVals = payload + sizeof(output_hdr_t) + 1;
+          d.programLen  = (uint8_t)(payloadLen - sizeof(output_hdr_t) - 1);
           d.action      = RS485B_ACT_PROGRAM;
           return d;
         }
@@ -441,15 +330,15 @@ static inline RS485BDecision rs485b_decide(const uint8_t *buf, uint16_t avail,
           return d;
       }
     }
-    case HMTL_MSG_TYPE_POLL:
+    case MSG_TYPE_POLL:
       // A poll needs no payload — the caller answers with this node's config block so a master
       // can enumerate the bus.
       d.action = RS485B_ACT_POLL;
       return d;
 
-    case HMTL_MSG_TYPE_SET_ADDR: {
-      if (payloadLen < sizeof(HmtlMsgSetAddr)) { d.action = RS485B_ACT_UNSUPPORTED; return d; }
-      HmtlMsgSetAddr m;
+    case MSG_TYPE_SET_ADDR: {
+      if (payloadLen < sizeof(msg_set_addr_t)) { d.action = RS485B_ACT_UNSUPPORTED; return d; }
+      msg_set_addr_t m;
       memcpy(&m, payload, sizeof(m));
       // SET_ADDRESS is normally sent to the broadcast address during commissioning, so the
       // device id is the real selector. device_id == 0 means "whoever hears this", which is how
@@ -464,7 +353,7 @@ static inline RS485BDecision rs485b_decide(const uint8_t *buf, uint16_t avail,
       d.action     = RS485B_ACT_SET_ADDRESS;
       return d;
     }
-    case HMTL_MSG_TYPE_SENSOR:
+    case MSG_TYPE_SENSOR:
       // Sensor broadcasts are handed over whole; rs485b_next_sensor() walks the records. v1 only
       // relays them (the sensorsync-rs485-transport follow-up consumes them).
       d.sensorData = payload;
@@ -479,7 +368,7 @@ static inline RS485BDecision rs485b_decide(const uint8_t *buf, uint16_t avail,
   }
 }
 
-// Step over one HmtlSensorData record in a SENSOR payload.
+// Step over one msg_sensor_data_t record in a SENSOR payload.
 //
 // A SENSOR message carries a run of variable-length records back to back, each a
 // { sensor_type, data_len } header followed by data_len bytes. Call this with offset 0, then
@@ -494,19 +383,26 @@ static inline RS485BDecision rs485b_decide(const uint8_t *buf, uint16_t avail,
 // `offset`. The two bounds checks are what make a hostile or corrupt `data_len` harmless: a
 // record claiming more bytes than the payload holds is refused rather than handed out as a
 // pointer/length pair the caller would read past the end of.
+//
+// This is the bounds-checked counterpart of HMTL's hmtl_next_sensor(), which lives in
+// HMTLMessaging.cpp (not linkable here) and does no such checking.
 static inline uint8_t rs485b_next_sensor(const uint8_t *data, uint8_t len, uint8_t offset,
                                          uint8_t *outType, const uint8_t **outData,
                                          uint8_t *outLen) {
-  // Is there even a record header left? (Arithmetic promotes to int, so this cannot wrap.)
-  if (offset + sizeof(HmtlSensorData) > len) return 0;
-  HmtlSensorData s;
-  memcpy(&s, data + offset, sizeof(s));
+  // msg_sensor_data_t ends in a flexible array member, so sizeof() is just the two-byte record
+  // header — which is exactly the quantity wanted here.
+  const size_t recHdr = sizeof(msg_sensor_data_t);
+  // Is there even a record header left? (sizeof() makes this size_t arithmetic; the uint8_t
+  // operands are far too small to wrap it.)
+  if (offset + recHdr > len) return 0;
   // Does the body the header claims actually fit inside the payload?
-  if (offset + sizeof(HmtlSensorData) + s.data_len > len) return 0;
-  *outType = s.sensor_type;
-  *outData = data + offset + sizeof(HmtlSensorData);
-  *outLen  = s.data_len;
-  return (uint8_t)(sizeof(HmtlSensorData) + s.data_len);
+  const uint8_t sensorType = data[offset];       // msg_sensor_data_t::sensor_type
+  const uint8_t dataLen    = data[offset + 1];   // msg_sensor_data_t::data_len
+  if (offset + recHdr + dataLen > len) return 0;
+  *outType = sensorType;
+  *outData = data + offset + recHdr;
+  *outLen  = dataLen;
+  return (uint8_t)(recHdr + dataLen);
 }
 
 // Map an HMTL program id onto the WLED effect id the bridge runs for it.
@@ -515,7 +411,7 @@ static inline uint8_t rs485b_next_sensor(const uint8_t *data, uint8_t len, uint8
 // HMTL program emulation. Returns -1 when there is no mapping, which covers two cases the caller
 // treats identically (count as unsupported, change nothing):
 //   * programs with no WLED analogue (SOUND_VALUE, SEQUENCE, TIMED_CHANGE, ...)
-//   * HMTL_PROGRAM_BRIGHTNESS / HMTL_PROGRAM_COLOR, which are one-shot property sets rather than
+//   * PROGRAM_BRIGHTNESS / PROGRAM_COLOR, which are one-shot property sets rather than
 //     modes — applyProgram() handles those before it ever consults this table.
 static inline int rs485b_program_to_mode(uint8_t program) {
   switch (program) {
@@ -615,7 +511,7 @@ struct RS485BTxQueue {
 // "tx-drop" at the loop() rate limit above.
 struct RS485BCounters {
   uint32_t rs485Rx      = 0;   // frames pulled off the bus
-  uint32_t rs485Handled = 0;   // frames acted on locally
+  uint32_t rs485Handled = 0;   // frames that reached a v1 action (see handleDecision's caveat)
   uint32_t rs485Relayed = 0;   // frames relayed to the WiFi peer
   uint32_t rs485Tx      = 0;   // frames written to the bus
   uint32_t errShort     = 0;
@@ -645,12 +541,20 @@ struct RS485BCounters {
   }
 };
 
-// Compile-time wire-layout guards. A mismatch here means the vendored copy has drifted from
-// HMTL/Libraries and legacy modules would no longer interoperate.
-static_assert(sizeof(HmtlMsgHdr)     == 8,  "HMTL msg_hdr_t must be 8 bytes on the wire");
-static_assert(sizeof(HmtlOutputHdr)  == 2,  "HMTL output_hdr_t must be 2 bytes on the wire");
-static_assert(sizeof(HmtlMsgValue)   == 4,  "HMTL msg_value_t must be 4 bytes on the wire");
-static_assert(sizeof(HmtlMsgRgb)     == 5,  "HMTL msg_rgb_t must be 5 bytes on the wire");
-static_assert(sizeof(HmtlMsgProgram) == 35, "HMTL msg_program_t must be 35 bytes on the wire");
-static_assert(sizeof(HmtlMsgSetAddr) == 4,  "HMTL msg_set_addr_t must be 4 bytes on the wire");
-static_assert(sizeof(HmtlConfigHdrV3) == 10, "HMTL config_hdr_v3_t must be 10 bytes on the wire");
+// Compile-time wire-layout guards on the imported HMTL structs. HMTL declares them without
+// __attribute__((packed)) — the field ordering happens to leave no interior padding on AVR,
+// Xtensa and x86-64 alike — so these assertions are what would catch a toolchain or an upstream
+// edit that changed that, i.e. that broke interoperability with deployed modules.
+//
+// msg_poll_response_t is deliberately absent: it is the one struct whose size is ABI-dependent
+// (15 bytes on AVR, 16 where uint16_t forces 2-byte alignment, from trailing padding only). Field
+// offsets are identical either way, and the bridge emits HMTL_MSG_POLL_MIN_LEN — exactly what
+// HMTL's own hmtl_poll_fmt() puts on the wire for the same target.
+static_assert(sizeof(msg_hdr_t)       == 8,  "HMTL msg_hdr_t must be 8 bytes on the wire");
+static_assert(sizeof(output_hdr_t)    == 2,  "HMTL output_hdr_t must be 2 bytes on the wire");
+static_assert(sizeof(msg_value_t)     == 4,  "HMTL msg_value_t must be 4 bytes on the wire");
+static_assert(sizeof(msg_rgb_t)       == 5,  "HMTL msg_rgb_t must be 5 bytes on the wire");
+static_assert(sizeof(msg_program_t)   == 35, "HMTL msg_program_t must be 35 bytes on the wire");
+static_assert(sizeof(msg_set_addr_t)  == 4,  "HMTL msg_set_addr_t must be 4 bytes on the wire");
+static_assert(sizeof(config_hdr_v3_t) == 10, "HMTL config_hdr_v3_t must be 10 bytes on the wire");
+static_assert(sizeof(msg_sensor_data_t) == 2, "HMTL msg_sensor_data_t header must be 2 bytes");

@@ -133,9 +133,10 @@ void UsermodRS485Bridge::connected() {
 // ---------------------------------------------------------------------------------------------
 // loop
 // ---------------------------------------------------------------------------------------------
-// Per-iteration service of both directions, in receive → transmit → ingest order so a frame that
-// arrives over UDP is not transmitted in the same pass it was queued (that would put two blocking
-// sends back to back when a burst arrives).
+// Per-iteration service of both directions, in receive → transmit → ingest order. That order is
+// not load-bearing for the rate limit — serviceTx()'s one-frame-per-call budget is, and it is
+// called exactly once per pass — it just means a frame ingested this pass waits until the next
+// one to go out, costing a single iteration of latency.
 //
 // The strip.isUpdating() bail-out matters: the LED drivers are timing-critical while shifting
 // data out, and this usermod's transmit step blocks for tens of milliseconds. Yielding the whole
@@ -246,7 +247,7 @@ void UsermodRS485Bridge::serviceUdp() {
     // Forward using the frame's OWN destination address — the bridge is a transport here and
     // does not rewrite addressing. h.length (not `len`) is the authoritative frame size, so any
     // trailing padding in the datagram is not put on the wire.
-    HmtlMsgHdr h;
+    msg_hdr_t h;
     memcpy(&h, buf, sizeof(h));
     if (!sendHmtlFrame(h.address, buf, h.length)) counters.txDropped++;
   }
@@ -274,7 +275,9 @@ bool UsermodRS485Bridge::sendHmtlFrame(uint16_t destAddr, const uint8_t *frame, 
 // (the HMTL header carries the destination, not the source, so replies need this).
 //
 // Note the counting policy: DROP/RELAY_ONLY/UNSUPPORTED return early and are NOT counted as
-// handled — rs485Handled means "a v1 command was executed against local state".
+// handled — rs485Handled counts frames that reached a v1 action. Caveat: a PROGRAM frame whose
+// program is unmapped or truncated bails inside applyProgram() (counted unsupported) but is
+// still counted handled here, and SENSOR frames are only relayed.
 void UsermodRS485Bridge::handleDecision(const RS485BDecision &d, const uint8_t *frame,
                                         uint8_t frameLen, uint16_t sourceAddr) {
   switch (d.action) {
@@ -361,11 +364,11 @@ void UsermodRS485Bridge::applyValue(uint16_t value) {
 void UsermodRS485Bridge::applyProgram(const RS485BDecision &d) {
   Segment &seg = strip.getMainSegment();
   switch (d.programType) {
-    case HMTL_PROGRAM_BRIGHTNESS:
+    case PROGRAM_BRIGHTNESS:
       if (d.programLen < 1) { counters.unsupported++; return; }
       bri = d.programVals[0];
       break;
-    case HMTL_PROGRAM_COLOR:
+    case PROGRAM_COLOR:
       if (d.programLen < 3) { counters.unsupported++; return; }   // needs a full RGB triple
       seg.setColor(0, RGBW32(d.programVals[0], d.programVals[1], d.programVals[2], 0));
       break;
@@ -387,19 +390,24 @@ void UsermodRS485Bridge::applyProgram(const RS485BDecision &d) {
 // Fields are reported honestly where an equivalent exists (baud, address, device id) and pinned
 // to a minimal truth where it does not: one output, hardware version 1, and a non-stock object
 // type so a master can tell a WLED bridge from a real HMTL module.
+//
+// The length is HMTL's own HMTL_MSG_POLL_MIN_LEN, i.e. exactly what hmtl_poll_fmt() puts on the
+// wire for this target: 24 bytes here, where uint16_t alignment adds a trailing pad byte to
+// msg_poll_response_t, versus 23 on AVR. Only trailing padding differs, so every field lands at
+// the same offset for a legacy master either way.
 void UsermodRS485Bridge::sendPollResponse(uint16_t to) {
-  const uint8_t len = (uint8_t)(sizeof(HmtlMsgHdr) + sizeof(HmtlMsgPollResponse));
-  uint8_t frame[sizeof(HmtlMsgHdr) + sizeof(HmtlMsgPollResponse)];
+  const uint8_t len = (uint8_t)HMTL_MSG_POLL_MIN_LEN;
+  uint8_t frame[HMTL_MSG_POLL_MIN_LEN];
   // ACK marks this as a response to a poll rather than a poll of our own.
-  if (!rs485b_hmtl_fmt(frame, sizeof(frame), address, len, HMTL_MSG_TYPE_POLL,
-                       HMTL_MSG_FLAG_ACK)) return;
+  if (!rs485b_hmtl_fmt(frame, sizeof(frame), address, len, MSG_TYPE_POLL,
+                       MSG_FLAG_ACK)) return;
 
-  HmtlMsgPollResponse resp;
+  msg_poll_response_t resp;
   memset(&resp, 0, sizeof(resp));   // zero first: every reserved/unused field goes out as 0
   resp.config.magic            = HMTL_CONFIG_MAGIC;
   resp.config.protocol_version = HMTL_CONFIG_VERSION;
   resp.config.hardware_version = 1;
-  resp.config.baud             = HMTL_BAUD_TO_BYTE(baud);
+  resp.config.baud             = BAUD_TO_BYTE(baud);
   resp.config.num_outputs      = 1;   // the bridge presents the strip as a single HMTL output
   resp.config.flags            = 0;
   resp.config.device_id        = effectiveDeviceId();
@@ -407,7 +415,7 @@ void UsermodRS485Bridge::sendPollResponse(uint16_t to) {
   resp.object_type             = HMTL_OBJECT_TYPE_WLED;
   resp.recv_buffer_size        = RS485_RECV_BUFFER;
   resp.msg_version             = HMTL_MSG_VERSION;
-  memcpy(frame + sizeof(HmtlMsgHdr), &resp, sizeof(resp));
+  memcpy(frame + sizeof(msg_hdr_t), &resp, sizeof(resp));
   // The CRC covers header AND payload, but rs485b_hmtl_fmt() ran before the payload was written,
   // so its stamp is stale. Re-stamp now or the response fails validation at any CRC-checking
   // receiver.
@@ -543,9 +551,12 @@ REGISTER_USERMOD(rs485_bridge_usermod);
 
 // Builds without -D USERMOD_RS485_BRIDGE / -D RS485_HARDWARE_SERIAL (the `[env:usermods]`
 // wildcard env and the per-usermod CI matrix) guard the bridge itself out — see the comment on
-// RS485_BRIDGE_BUILD in usermod_rs485_bridge.h. The pure protocol header has no such
-// dependencies, so it is still compiled here: its static_asserts are the wire-layout regression
-// check, and they give this usermod real coverage in those builds.
+// RS485_BRIDGE_BUILD in usermod_rs485_bridge.h.
+//
+// rs485_bridge_protocol.h is NOT included here: it imports the wire format from the HMTL
+// submodule, which is only on the build path in the RS485-enabled env (and is not cloned by the
+// CI workflows at all). Its wire-layout static_asserts are covered instead by `pio run -e
+// ampworks` and by the host test, which compiles the same HMTL header with a plain c++.
 //
 // An inert placeholder usermod stands in for the real one, for two reasons:
 //   * pio-scripts/validate_modules.py fails the build for any enrolled usermod that contributes
@@ -553,12 +564,12 @@ REGISTER_USERMOD(rs485_bridge_usermod);
 //     unreferenced is dropped by --gc-sections, leaving no CU. REGISTER_USERMOD's pointer lands
 //     in the KEEP'd .dynarray.usermods section, so the CU survives.
 //   * It makes the situation legible at runtime instead of the usermod silently not existing.
-#include "rs485_bridge_protocol.h"
 
 class UsermodRS485BridgeUnavailable : public Usermod {
  public:
   void setup() override {}   // nothing to bring up
   void loop() override {}    // nothing to service
+  // Usermod id (USERMOD_ID_RS485_BRIDGE) — what UsermodManager::lookup() finds this bridge by.
   uint16_t getId() override { return USERMOD_ID_RS485_BRIDGE; }
   // Report the not-built state on the info page, so a board flashed with the wrong env says so
   // instead of the usermod simply not appearing.

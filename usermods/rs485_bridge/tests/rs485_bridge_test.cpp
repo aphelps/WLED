@@ -1,8 +1,18 @@
 // Host unit test for the RS485/HMTL bridge wire format + decision logic.
 //
-// Builds with a normal host compiler (no Arduino/WLED) — includes only the pure protocol header:
-//   c++ -std=c++11 -Wall -Wextra -o /tmp/rs485_test rs485_bridge_test.cpp && /tmp/rs485_test
-// Exits 0 on success, 1 on the first failed assertion.
+// Builds with a normal host compiler — no Arduino, no WLED, no PlatformIO. Run from the
+// super-repo root:
+//
+//   c++ -std=c++11 -Wall -Wextra \
+//       -I HMTL/Libraries/HMTLprotocol -I ArduinoLibs/Socket \
+//       -o /tmp/rs485_test WLED/usermods/rs485_bridge/tests/rs485_bridge_test.cpp \
+//     && /tmp/rs485_test
+//
+// The two -I flags are the *real* HMTL and ArduinoLibs headers: this test is therefore also the
+// acceptance check that HMTLWireFormat.h is genuinely dependency-free. Any Arduino.h or
+// RS485Utils.h leaking into it would fail this compile immediately.
+//
+// Exits 0 on success, 1 if any assertion failed.
 //
 #include "../rs485_bridge_protocol.h"
 #include <cstdio>
@@ -28,7 +38,7 @@ static const uint16_t SELF_DEV  = 0x1234;   // its HMTL device id (SET_ADDRESS i
 
 // Write just an HMTL header. `len` is the TOTAL frame length the header will declare.
 static uint8_t build_hdr(uint8_t *buf, uint16_t addr, uint8_t len, uint8_t type, uint8_t flags) {
-  HmtlMsgHdr h;
+  msg_hdr_t h;
   h.startcode = HMTL_MSG_START;
   h.crc = 0; h.version = HMTL_MSG_VERSION; h.length = len;
   h.type = type; h.flags = flags; h.address = addr;
@@ -39,24 +49,24 @@ static uint8_t build_hdr(uint8_t *buf, uint16_t addr, uint8_t len, uint8_t type,
 // Build an OUTPUT/RGB frame setting `output` to (r, g, b).
 static uint8_t build_rgb(uint8_t *buf, uint16_t addr, uint8_t output,
                          uint8_t r, uint8_t g, uint8_t b) {
-  const uint8_t len = sizeof(HmtlMsgHdr) + sizeof(HmtlMsgRgb);
-  build_hdr(buf, addr, len, HMTL_MSG_TYPE_OUTPUT, 0);
-  HmtlMsgRgb m;
+  const uint8_t len = sizeof(msg_hdr_t) + sizeof(msg_rgb_t);
+  build_hdr(buf, addr, len, MSG_TYPE_OUTPUT, 0);
+  msg_rgb_t m;
   m.hdr.type = HMTL_OUTPUT_RGB; m.hdr.output = output;
   m.values[0] = r; m.values[1] = g; m.values[2] = b;
-  memcpy(buf + sizeof(HmtlMsgHdr), &m, sizeof(m));
+  memcpy(buf + sizeof(msg_hdr_t), &m, sizeof(m));
   return len;
 }
 
 // Build an OUTPUT/VALUE frame. `value` is masked to the 13 bits the wire field actually carries.
 static uint8_t build_value(uint8_t *buf, uint16_t addr, uint8_t output, uint16_t value) {
-  const uint8_t len = sizeof(HmtlMsgHdr) + sizeof(HmtlMsgValue);
-  build_hdr(buf, addr, len, HMTL_MSG_TYPE_OUTPUT, 0);
-  HmtlMsgValue m;
+  const uint8_t len = sizeof(msg_hdr_t) + sizeof(msg_value_t);
+  build_hdr(buf, addr, len, MSG_TYPE_OUTPUT, 0);
+  msg_value_t m;
   memset(&m, 0, sizeof(m));
   m.hdr.type = HMTL_OUTPUT_VALUE; m.hdr.output = output;
   m.value = value & 0x1FFF; m.flags = 0;
-  memcpy(buf + sizeof(HmtlMsgHdr), &m, sizeof(m));
+  memcpy(buf + sizeof(msg_hdr_t), &m, sizeof(m));
   return len;
 }
 
@@ -66,33 +76,35 @@ static uint8_t build_value(uint8_t *buf, uint16_t addr, uint8_t output, uint16_t
 // any length from zero values upward.
 static uint8_t build_program(uint8_t *buf, uint16_t addr, uint8_t output, uint8_t progType,
                              const uint8_t *vals, uint8_t tail) {
-  const uint8_t len = (uint8_t)(sizeof(HmtlMsgHdr) + sizeof(HmtlOutputHdr) + 1 + tail);
-  build_hdr(buf, addr, len, HMTL_MSG_TYPE_OUTPUT, 0);
-  HmtlOutputHdr oh; oh.type = HMTL_OUTPUT_PROGRAM; oh.output = output;
-  memcpy(buf + sizeof(HmtlMsgHdr), &oh, sizeof(oh));
-  buf[sizeof(HmtlMsgHdr) + sizeof(HmtlOutputHdr)] = progType;
-  if (tail) memcpy(buf + sizeof(HmtlMsgHdr) + sizeof(HmtlOutputHdr) + 1, vals, tail);
+  const uint8_t len = (uint8_t)(sizeof(msg_hdr_t) + sizeof(output_hdr_t) + 1 + tail);
+  build_hdr(buf, addr, len, MSG_TYPE_OUTPUT, 0);
+  output_hdr_t oh; oh.type = HMTL_OUTPUT_PROGRAM; oh.output = output;
+  memcpy(buf + sizeof(msg_hdr_t), &oh, sizeof(oh));
+  buf[sizeof(msg_hdr_t) + sizeof(output_hdr_t)] = progType;
+  if (tail) memcpy(buf + sizeof(msg_hdr_t) + sizeof(output_hdr_t) + 1, vals, tail);
   return len;
 }
 
 // Build a SET_ADDR frame. `devId` is the selector (0 == any device), `newAddr` the address to
 // take on; `addr` is still the ordinary HMTL destination.
 static uint8_t build_set_addr(uint8_t *buf, uint16_t addr, uint16_t devId, uint16_t newAddr) {
-  const uint8_t len = sizeof(HmtlMsgHdr) + sizeof(HmtlMsgSetAddr);
-  build_hdr(buf, addr, len, HMTL_MSG_TYPE_SET_ADDR, 0);
-  HmtlMsgSetAddr m; m.device_id = devId; m.address = newAddr;
-  memcpy(buf + sizeof(HmtlMsgHdr), &m, sizeof(m));
+  const uint8_t len = sizeof(msg_hdr_t) + sizeof(msg_set_addr_t);
+  build_hdr(buf, addr, len, MSG_TYPE_SET_ADDR, 0);
+  msg_set_addr_t m; m.device_id = devId; m.address = newAddr;
+  memcpy(buf + sizeof(msg_hdr_t), &m, sizeof(m));
   return len;
 }
 
 // Build a SENSOR frame carrying exactly one sensor record.
 static uint8_t build_sensor(uint8_t *buf, uint16_t addr, uint8_t sensorType,
                             const uint8_t *data, uint8_t dataLen) {
-  const uint8_t len = (uint8_t)(sizeof(HmtlMsgHdr) + sizeof(HmtlSensorData) + dataLen);
-  build_hdr(buf, addr, len, HMTL_MSG_TYPE_SENSOR, 0);
-  HmtlSensorData s; s.sensor_type = sensorType; s.data_len = dataLen;
-  memcpy(buf + sizeof(HmtlMsgHdr), &s, sizeof(s));
-  memcpy(buf + sizeof(HmtlMsgHdr) + sizeof(HmtlSensorData), data, dataLen);
+  const uint8_t len = (uint8_t)(sizeof(msg_hdr_t) + sizeof(msg_sensor_data_t) + dataLen);
+  build_hdr(buf, addr, len, MSG_TYPE_SENSOR, 0);
+  // msg_sensor_data_t ends in a flexible array member, so its two fixed fields are written by
+  // hand rather than through a local of that type.
+  buf[sizeof(msg_hdr_t)]     = sensorType;   // msg_sensor_data_t::sensor_type
+  buf[sizeof(msg_hdr_t) + 1] = dataLen;      // msg_sensor_data_t::data_len
+  memcpy(buf + sizeof(msg_hdr_t) + sizeof(msg_sensor_data_t), data, dataLen);
   return len;
 }
 
@@ -107,12 +119,12 @@ int main() {
 
   // 1) Wire layout is what legacy HMTL modules expect.
   {
-    CHECK(sizeof(HmtlMsgHdr) == 8, "msg_hdr_t is 8B");
-    CHECK(sizeof(HmtlMsgRgb) == 5, "msg_rgb_t is 5B");
-    CHECK(sizeof(HmtlMsgValue) == 4, "msg_value_t is 4B");
-    CHECK(sizeof(HmtlMsgProgram) == 35, "msg_program_t is 35B");
+    CHECK(sizeof(msg_hdr_t) == 8, "msg_hdr_t is 8B");
+    CHECK(sizeof(msg_rgb_t) == 5, "msg_rgb_t is 5B");
+    CHECK(sizeof(msg_value_t) == 4, "msg_value_t is 4B");
+    CHECK(sizeof(msg_program_t) == 35, "msg_program_t is 35B");
     // Field offsets: length at 3, address at 6 — the bridge indexes buf[3] directly.
-    HmtlMsgHdr h; memset(&h, 0, sizeof(h));
+    msg_hdr_t h; memset(&h, 0, sizeof(h));
     CHECK((size_t)((uint8_t *)&h.length  - (uint8_t *)&h) == 3, "length at offset 3");
     CHECK((size_t)((uint8_t *)&h.address - (uint8_t *)&h) == 6, "address at offset 6");
   }
@@ -150,7 +162,7 @@ int main() {
     CHECK(buf[1] == 0, "unstamped frame has crc 0");
     CHECK(rs485b_validate(buf, len) == RS485B_OK, "crc 0 accepted (legacy no-CRC sender)");
 
-    CHECK(rs485b_validate(buf, sizeof(HmtlMsgHdr) - 1) == RS485B_ERR_SHORT, "short buffer");
+    CHECK(rs485b_validate(buf, sizeof(msg_hdr_t) - 1) == RS485B_ERR_SHORT, "short buffer");
     CHECK(rs485b_validate(nullptr, 64) == RS485B_ERR_SHORT, "null buffer");
     CHECK(rs485b_validate(buf, (uint16_t)(len - 1)) == RS485B_ERR_SHORT, "avail < hdr.length");
 
@@ -174,7 +186,7 @@ int main() {
   // 5) Addressing: exact match or broadcast.
   {
     CHECK(rs485b_addressed_to(SELF_ADDR, SELF_ADDR), "exact address matches");
-    CHECK(rs485b_addressed_to(HMTL_ADDR_BROADCAST, SELF_ADDR), "broadcast matches");
+    CHECK(rs485b_addressed_to(SOCKET_ADDR_ANY, SELF_ADDR), "broadcast matches");
     CHECK(!rs485b_addressed_to(0x0099, SELF_ADDR), "other address does not match");
   }
 
@@ -190,7 +202,7 @@ int main() {
 
   // 7) Broadcast RGB is also ours; a frame for another node is relay-only.
   {
-    uint8_t len = build_rgb(buf, HMTL_ADDR_BROADCAST, HMTL_ALL_OUTPUTS, 1, 2, 3);
+    uint8_t len = build_rgb(buf, SOCKET_ADDR_ANY, HMTL_ALL_OUTPUTS, 1, 2, 3);
     RS485BDecision d = rs485b_decide(buf, len, SELF_ADDR, SELF_DEV);
     CHECK(d.action == RS485B_ACT_SET_RGB, "broadcast rgb is handled locally");
     CHECK(d.output == HMTL_ALL_OUTPUTS, "ALL_OUTPUTS preserved");
@@ -232,7 +244,7 @@ int main() {
     // Unmapped programs are reported so the caller can count-and-ignore them.
     CHECK(rs485b_program_to_mode(HMTL_PROGRAM_SOUND_VALUE) == -1, "sound_value unmapped");
     CHECK(rs485b_program_to_mode(HMTL_PROGRAM_SEQUENCE) == -1, "sequence unmapped");
-    CHECK(rs485b_program_to_mode(HMTL_PROGRAM_BRIGHTNESS) == -1, "brightness is not a mode");
+    CHECK(rs485b_program_to_mode(PROGRAM_BRIGHTNESS) == -1, "brightness is not a mode");
     CHECK(rs485b_program_to_mode(HMTL_PROGRAM_NONE) == RS485B_WLED_MODE_STATIC, "none -> static");
     CHECK(rs485b_program_to_mode(HMTL_PROGRAM_FADE) == RS485B_WLED_MODE_FADE, "fade mapped");
     CHECK(rs485b_program_to_mode(HMTL_PROGRAM_CIRCULAR) == RS485B_WLED_MODE_CHASE, "circ mapped");
@@ -241,31 +253,31 @@ int main() {
   // 10) An OUTPUT frame whose payload is too short for its declared output type is unsupported,
   //     never a buffer over-read.
   {
-    uint8_t len = (uint8_t)(sizeof(HmtlMsgHdr) + 1);
-    build_hdr(buf, SELF_ADDR, len, HMTL_MSG_TYPE_OUTPUT, 0);
-    buf[sizeof(HmtlMsgHdr)] = HMTL_OUTPUT_RGB;
+    uint8_t len = (uint8_t)(sizeof(msg_hdr_t) + 1);
+    build_hdr(buf, SELF_ADDR, len, MSG_TYPE_OUTPUT, 0);
+    buf[sizeof(msg_hdr_t)] = HMTL_OUTPUT_RGB;
     RS485BDecision d = rs485b_decide(buf, len, SELF_ADDR, SELF_DEV);
     CHECK(d.action == RS485B_ACT_UNSUPPORTED, "output header truncated -> unsupported");
 
     // Full output header but a truncated RGB body.
-    len = (uint8_t)(sizeof(HmtlMsgHdr) + sizeof(HmtlOutputHdr) + 1);
-    build_hdr(buf, SELF_ADDR, len, HMTL_MSG_TYPE_OUTPUT, 0);
-    HmtlOutputHdr oh; oh.type = HMTL_OUTPUT_RGB; oh.output = 0;
-    memcpy(buf + sizeof(HmtlMsgHdr), &oh, sizeof(oh));
+    len = (uint8_t)(sizeof(msg_hdr_t) + sizeof(output_hdr_t) + 1);
+    build_hdr(buf, SELF_ADDR, len, MSG_TYPE_OUTPUT, 0);
+    output_hdr_t oh; oh.type = HMTL_OUTPUT_RGB; oh.output = 0;
+    memcpy(buf + sizeof(msg_hdr_t), &oh, sizeof(oh));
     d = rs485b_decide(buf, len, SELF_ADDR, SELF_DEV);
     CHECK(d.action == RS485B_ACT_UNSUPPORTED, "truncated rgb body -> unsupported");
 
     // Unknown output type.
     len = build_rgb(buf, SELF_ADDR, 0, 1, 2, 3);
-    buf[sizeof(HmtlMsgHdr)] = HMTL_OUTPUT_XBEE;
+    buf[sizeof(msg_hdr_t)] = HMTL_OUTPUT_XBEE;
     d = rs485b_decide(buf, len, SELF_ADDR, SELF_DEV);
     CHECK(d.action == RS485B_ACT_UNSUPPORTED, "unknown output type -> unsupported");
   }
 
   // 11) POLL is answered; the RESPONSE flag is surfaced.
   {
-    uint8_t len = build_hdr(buf, SELF_ADDR, sizeof(HmtlMsgHdr), HMTL_MSG_TYPE_POLL,
-                            HMTL_MSG_FLAG_RESPONSE);
+    uint8_t len = build_hdr(buf, SELF_ADDR, sizeof(msg_hdr_t), MSG_TYPE_POLL,
+                            MSG_FLAG_RESPONSE);
     RS485BDecision d = rs485b_decide(buf, len, SELF_ADDR, SELF_DEV);
     CHECK(d.action == RS485B_ACT_POLL, "poll -> POLL");
     CHECK(d.wantsResponse, "RESPONSE flag decoded");
@@ -290,15 +302,15 @@ int main() {
   // 13) SENSOR payloads iterate cleanly and never run past the buffer.
   {
     const uint8_t payload[2] = { 0x10, 0x20 };
-    uint8_t len = build_sensor(buf, HMTL_ADDR_BROADCAST, HMTL_SENSOR_SOUND, payload, 2);
+    uint8_t len = build_sensor(buf, SOCKET_ADDR_ANY, HMTL_SENSOR_SOUND, payload, 2);
     RS485BDecision d = rs485b_decide(buf, len, SELF_ADDR, SELF_DEV);
     CHECK(d.action == RS485B_ACT_SENSOR, "sensor -> SENSOR");
-    CHECK(d.sensorLen == sizeof(HmtlSensorData) + 2, "sensor payload length");
+    CHECK(d.sensorLen == sizeof(msg_sensor_data_t) + 2, "sensor payload length");
 
     uint8_t type = 0, dlen = 0;
     const uint8_t *dptr = nullptr;
     uint8_t used = rs485b_next_sensor(d.sensorData, d.sensorLen, 0, &type, &dptr, &dlen);
-    CHECK(used == sizeof(HmtlSensorData) + 2, "one sensor record consumed");
+    CHECK(used == sizeof(msg_sensor_data_t) + 2, "one sensor record consumed");
     CHECK(type == HMTL_SENSOR_SOUND && dlen == 2 && dptr[0] == 0x10, "sensor record decoded");
     CHECK(rs485b_next_sensor(d.sensorData, d.sensorLen, used, &type, &dptr, &dlen) == 0,
           "no second record");
@@ -310,7 +322,7 @@ int main() {
 
   // 14) Unknown message types are counted, not acted on.
   {
-    uint8_t len = build_hdr(buf, SELF_ADDR, sizeof(HmtlMsgHdr), HMTL_MSG_TYPE_TIMESYNC, 0);
+    uint8_t len = build_hdr(buf, SELF_ADDR, sizeof(msg_hdr_t), MSG_TYPE_TIMESYNC, 0);
     RS485BDecision d = rs485b_decide(buf, len, SELF_ADDR, SELF_DEV);
     CHECK(d.action == RS485B_ACT_UNSUPPORTED, "timesync is outside the v1 set");
   }
@@ -330,17 +342,17 @@ int main() {
           "small frame accepted for forwarding");
     // Declare a frame longer than the socket data buffer.
     uint8_t big[128];
-    build_hdr(big, 0x0005, 100, HMTL_MSG_TYPE_OUTPUT, 0);
-    memset(big + sizeof(HmtlMsgHdr), 0, 100 - sizeof(HmtlMsgHdr));
+    build_hdr(big, 0x0005, 100, MSG_TYPE_OUTPUT, 0);
+    memset(big + sizeof(msg_hdr_t), 0, 100 - sizeof(msg_hdr_t));
     CHECK(rs485b_validate_udp_ingress(big, 100, RS485B_TX_SLOT_LEN) == RS485B_ERR_OVERSIZE,
           "oversized frame rejected before sendMsgTo");
     // Exactly at the limit is fine.
-    build_hdr(big, 0x0005, RS485B_TX_SLOT_LEN, HMTL_MSG_TYPE_OUTPUT, 0);
-    memset(big + sizeof(HmtlMsgHdr), 0, RS485B_TX_SLOT_LEN - sizeof(HmtlMsgHdr));
+    build_hdr(big, 0x0005, RS485B_TX_SLOT_LEN, MSG_TYPE_OUTPUT, 0);
+    memset(big + sizeof(msg_hdr_t), 0, RS485B_TX_SLOT_LEN - sizeof(msg_hdr_t));
     CHECK(rs485b_validate_udp_ingress(big, RS485B_TX_SLOT_LEN, RS485B_TX_SLOT_LEN) == RS485B_OK,
           "frame exactly at the buffer limit accepted");
     // A datagram that claims more than it delivers is short, not oversize.
-    build_hdr(big, 0x0005, 40, HMTL_MSG_TYPE_OUTPUT, 0);
+    build_hdr(big, 0x0005, 40, MSG_TYPE_OUTPUT, 0);
     CHECK(rs485b_validate_udp_ingress(big, 20, RS485B_TX_SLOT_LEN) == RS485B_ERR_SHORT,
           "truncated datagram rejected");
   }
@@ -402,15 +414,15 @@ int main() {
   // 19) rs485b_hmtl_fmt produces a frame that validates, and refuses bad sizes.
   {
     uint8_t out[64];
-    uint8_t len = rs485b_hmtl_fmt(out, sizeof(out), 0x0021, sizeof(HmtlMsgHdr),
-                                  HMTL_MSG_TYPE_POLL, HMTL_MSG_FLAG_ACK);
-    CHECK(len == sizeof(HmtlMsgHdr), "fmt returns the frame length");
+    uint8_t len = rs485b_hmtl_fmt(out, sizeof(out), 0x0021, sizeof(msg_hdr_t),
+                                  MSG_TYPE_POLL, MSG_FLAG_ACK);
+    CHECK(len == sizeof(msg_hdr_t), "fmt returns the frame length");
     CHECK(rs485b_validate(out, len) == RS485B_OK, "formatted frame validates");
-    HmtlMsgHdr h; memcpy(&h, out, sizeof(h));
-    CHECK(h.address == 0x0021 && h.type == HMTL_MSG_TYPE_POLL, "fmt fields land");
-    CHECK(rs485b_hmtl_fmt(out, sizeof(out), 0, 3, HMTL_MSG_TYPE_POLL, 0) == 0,
+    msg_hdr_t h; memcpy(&h, out, sizeof(h));
+    CHECK(h.address == 0x0021 && h.type == MSG_TYPE_POLL, "fmt fields land");
+    CHECK(rs485b_hmtl_fmt(out, sizeof(out), 0, 3, MSG_TYPE_POLL, 0) == 0,
           "fmt refuses a sub-header length");
-    CHECK(rs485b_hmtl_fmt(out, 4, 0, sizeof(HmtlMsgHdr), HMTL_MSG_TYPE_POLL, 0) == 0,
+    CHECK(rs485b_hmtl_fmt(out, 4, 0, sizeof(msg_hdr_t), MSG_TYPE_POLL, 0) == 0,
           "fmt refuses a too-small buffer");
   }
 
