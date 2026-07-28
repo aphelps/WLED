@@ -9,16 +9,24 @@
 #include <cstring>
 
 static int g_fail = 0;
+// Records a failure and keeps going, so one run reports every broken assertion rather than only
+// the first — much faster to work through when a wire-format change breaks several at once.
 #define CHECK(cond, msg) do { \
   if (!(cond)) { printf("FAIL: %s (line %d)\n", msg, __LINE__); g_fail = 1; } \
 } while (0)
 
-static const uint16_t SELF_ADDR = 0x0007;
-static const uint16_t SELF_DEV  = 0x1234;
+static const uint16_t SELF_ADDR = 0x0007;   // the address the simulated bridge listens on
+static const uint16_t SELF_DEV  = 0x1234;   // its HMTL device id (SET_ADDRESS is keyed on this)
 
 // ---------------------------------------------------------------------------------------------
 // Frame builders (mirror HMTL's hmtl_*_fmt helpers)
 // ---------------------------------------------------------------------------------------------
+// These construct frames the way a legacy HMTL module would, independently of the header's own
+// rs485b_hmtl_fmt(), so the tests exercise the parser against externally-shaped input rather than
+// only against what this code itself emits. Each returns the total frame length and leaves the
+// crc byte at 0 (valid — stock HMTL builds do not use CRC); call stamp_crc() to check that path.
+
+// Write just an HMTL header. `len` is the TOTAL frame length the header will declare.
 static uint8_t build_hdr(uint8_t *buf, uint16_t addr, uint8_t len, uint8_t type, uint8_t flags) {
   HmtlMsgHdr h;
   h.startcode = HMTL_MSG_START;
@@ -28,6 +36,7 @@ static uint8_t build_hdr(uint8_t *buf, uint16_t addr, uint8_t len, uint8_t type,
   return len;
 }
 
+// Build an OUTPUT/RGB frame setting `output` to (r, g, b).
 static uint8_t build_rgb(uint8_t *buf, uint16_t addr, uint8_t output,
                          uint8_t r, uint8_t g, uint8_t b) {
   const uint8_t len = sizeof(HmtlMsgHdr) + sizeof(HmtlMsgRgb);
@@ -39,6 +48,7 @@ static uint8_t build_rgb(uint8_t *buf, uint16_t addr, uint8_t output,
   return len;
 }
 
+// Build an OUTPUT/VALUE frame. `value` is masked to the 13 bits the wire field actually carries.
 static uint8_t build_value(uint8_t *buf, uint16_t addr, uint8_t output, uint16_t value) {
   const uint8_t len = sizeof(HmtlMsgHdr) + sizeof(HmtlMsgValue);
   build_hdr(buf, addr, len, HMTL_MSG_TYPE_OUTPUT, 0);
@@ -50,7 +60,10 @@ static uint8_t build_value(uint8_t *buf, uint16_t addr, uint8_t output, uint16_t
   return len;
 }
 
-// `tail` = how many program value bytes to actually transmit (senders may truncate).
+// Build an OUTPUT/PROGRAM frame.
+// `tail` is how many program value bytes to actually transmit: msg_program_t is a fixed 35 bytes
+// in the HMTL headers, but real senders truncate the unused tail, so the parser must cope with
+// any length from zero values upward.
 static uint8_t build_program(uint8_t *buf, uint16_t addr, uint8_t output, uint8_t progType,
                              const uint8_t *vals, uint8_t tail) {
   const uint8_t len = (uint8_t)(sizeof(HmtlMsgHdr) + sizeof(HmtlOutputHdr) + 1 + tail);
@@ -62,6 +75,8 @@ static uint8_t build_program(uint8_t *buf, uint16_t addr, uint8_t output, uint8_
   return len;
 }
 
+// Build a SET_ADDR frame. `devId` is the selector (0 == any device), `newAddr` the address to
+// take on; `addr` is still the ordinary HMTL destination.
 static uint8_t build_set_addr(uint8_t *buf, uint16_t addr, uint16_t devId, uint16_t newAddr) {
   const uint8_t len = sizeof(HmtlMsgHdr) + sizeof(HmtlMsgSetAddr);
   build_hdr(buf, addr, len, HMTL_MSG_TYPE_SET_ADDR, 0);
@@ -70,6 +85,7 @@ static uint8_t build_set_addr(uint8_t *buf, uint16_t addr, uint16_t devId, uint1
   return len;
 }
 
+// Build a SENSOR frame carrying exactly one sensor record.
 static uint8_t build_sensor(uint8_t *buf, uint16_t addr, uint8_t sensorType,
                             const uint8_t *data, uint8_t dataLen) {
   const uint8_t len = (uint8_t)(sizeof(HmtlMsgHdr) + sizeof(HmtlSensorData) + dataLen);
@@ -80,10 +96,14 @@ static uint8_t build_sensor(uint8_t *buf, uint16_t addr, uint8_t sensorType,
   return len;
 }
 
+// Fill in a frame's crc byte the way a CRC-enabled HMTL sender would.
 static void stamp_crc(uint8_t *buf, uint8_t len) { buf[1] = rs485b_hmtl_crc(buf, len); }
 
+// Run every test group in order and report. Groups are numbered and self-contained: each builds
+// its own frames in the shared `buf` and asserts on the result, so they can be read (or deleted)
+// independently.
 int main() {
-  uint8_t buf[128];
+  uint8_t buf[128];   // HMTL_MAX_MSG_LEN — big enough for any legal frame
 
   // 1) Wire layout is what legacy HMTL modules expect.
   {

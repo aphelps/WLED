@@ -60,27 +60,36 @@
  */
 class UsermodRS485Bridge : public Usermod {
  public:
-  static const char _name[];
-  static const char _enabled[];
+  static const char _name[];      // config section name, also the settings-page heading
+  static const char _enabled[];   // config key for the enable flag
 
+  // Claim the GPIOs, open the UART and attach RS485Socket. Sole caller of begin()/init().
   void setup() override;
+  // WiFi (re)connected — marks the UDP socket for rebinding.
   void connected() override;
+  // Per-iteration service of both directions; see the .cpp for the rate-limiting rationale.
   void loop() override;
 
   uint16_t getId() override { return USERMOD_ID_RS485_BRIDGE; }
+  // Publish state + counters into /json/info.
   void addToJsonInfo(JsonObject &root) override;
+  // Write the settings into cfg.json / the Settings -> Usermods form.
   void addToConfig(JsonObject &root) override;
+  // Read the settings back; returns false when the config predates this usermod.
   bool readFromConfig(JsonObject &root) override;
 
-  // Queue an HMTL frame for transmission on the RS485 bus. Returns false if the frame did not
-  // fit a queue slot or an older queued frame had to be dropped to make room.
+  // Queue an HMTL frame for transmission on the RS485 bus. Returns false if the bridge is not
+  // running, the frame did not fit a queue slot, or an older queued frame had to be dropped to
+  // make room. Public so other usermods can push HMTL traffic onto the bus.
   bool sendHmtlFrame(uint16_t destAddr, const uint8_t *frame, uint8_t frameLen);
 
-  bool isRunning() const { return running; }
-  uint16_t getAddress() const { return address; }
+  bool isRunning() const { return running; }        // true once pins + socket are up
+  uint16_t getAddress() const { return address; }   // this node's RS485 socket address
 
  private:
-  // Frames drained from the bus per loop(). Reception is cheap; transmission is not.
+  // Work budgets per loop() iteration. Reception is cheap (non-blocking reads of tens of bytes);
+  // transmission is not, which is why serviceTx() has a budget of exactly one and needs no
+  // constant here. UDP_BUF_LEN matches a transmit slot because nothing larger can be forwarded.
   static const uint8_t  RX_PER_LOOP  = 4;
   static const uint8_t  UDP_PER_LOOP = 4;
   static const uint16_t UDP_BUF_LEN  = RS485B_TX_SLOT_LEN;
@@ -115,19 +124,20 @@ class UsermodRS485Bridge : public Usermod {
   RS485BTxQueue  txQueue;
   RS485BCounters counters;
 
-  bool allocatePins();
-  void releasePins();
-  void serviceRs485();
-  void serviceTx();
-  void serviceUdp();
+  bool allocatePins();      // reserve {rx, tx, en} with PinManager, all-or-nothing
+  void releasePins();       // hand them back
+  void serviceRs485();      // slave path: drain and act on up to RX_PER_LOOP received frames
+  void serviceTx();         // master path: write ONE queued frame (the blocking-send rate limit)
+  void serviceUdp();        // master path: accept up to UDP_PER_LOOP HMTL datagrams from WiFi
+  // Execute the decision rs485b_decide() reached; `sourceAddr` is the socket-layer sender.
   void handleDecision(const RS485BDecision &d, const uint8_t *frame, uint8_t frameLen,
                       uint16_t sourceAddr);
-  void applyRgb(const uint8_t rgb[3]);
-  void applyValue(uint16_t value);
-  void applyProgram(const RS485BDecision &d);
-  void sendPollResponse(uint16_t to);
-  void relayToPeer(const uint8_t *frame, uint8_t frameLen);
-  uint16_t effectiveDeviceId() const;
+  void applyRgb(const uint8_t rgb[3]);      // HMTL RGB   -> main segment colour, mode STATIC
+  void applyValue(uint16_t value);          // HMTL VALUE -> master brightness (clamped to 8 bit)
+  void applyProgram(const RS485BDecision &d);   // HMTL PROGRAM -> effect / brightness / colour
+  void sendPollResponse(uint16_t to);       // answer a POLL with this node's config block
+  void relayToPeer(const uint8_t *frame, uint8_t frameLen);   // RS485 -> last WiFi peer
+  uint16_t effectiveDeviceId() const;       // configured id, or one derived from the MAC
 };
 
 #endif  // RS485_BRIDGE_BUILD
