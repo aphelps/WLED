@@ -392,9 +392,11 @@ void UsermodRS485Bridge::applyProgram(const RS485BDecision &d) {
 // type so a master can tell a WLED bridge from a real HMTL module.
 //
 // The length is HMTL's own HMTL_MSG_POLL_MIN_LEN, i.e. exactly what hmtl_poll_fmt() puts on the
-// wire for this target: 24 bytes here, where uint16_t alignment adds a trailing pad byte to
-// msg_poll_response_t, versus 23 on AVR. Only trailing padding differs, so every field lands at
-// the same offset for a legacy master either way.
+// wire — 23 bytes, on every target. That used to be target-dependent (23 on AVR, 24 here, from a
+// trailing pad byte uint16_t alignment added to msg_poll_response_t), which meant a legacy AVR
+// master length-checking a poll response against its own sizeof could reject a structurally valid
+// one from the bridge. HMTLWireFormat.h now packs every wire struct, so the two agree; see the
+// static_assert block in rs485_bridge_protocol.h.
 void UsermodRS485Bridge::sendPollResponse(uint16_t to) {
   const uint8_t len = (uint8_t)HMTL_MSG_POLL_MIN_LEN;
   uint8_t frame[HMTL_MSG_POLL_MIN_LEN];

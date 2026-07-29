@@ -3,19 +3,27 @@
 // Builds with a normal host compiler — no Arduino, no WLED, no PlatformIO. Run from the
 // super-repo root:
 //
-//   c++ -std=c++11 -Wall -Wextra \
-//       -I HMTL/Libraries/HMTLprotocol -I ArduinoLibs/Socket \
-//       -o /tmp/rs485_test WLED/usermods/rs485_bridge/tests/rs485_bridge_test.cpp \
+//   c++ -std=c++11 -Wall -Wextra
+//       -I HMTL/Libraries/HMTLprotocol -I ArduinoLibs/Socket
+//       -o /tmp/rs485_test WLED/usermods/rs485_bridge/tests/rs485_bridge_test.cpp
 //     && /tmp/rs485_test
+//
+// (No trailing backslashes above: a line continuation inside a // comment is what -Wcomment
+// warns about, and this file is compiled warning-free under clang and g++ >= 9 alike.)
 //
 // The two -I flags are the *real* HMTL and ArduinoLibs headers: this test is therefore also the
 // acceptance check that HMTLWireFormat.h is genuinely dependency-free. Any Arduino.h or
 // RS485Utils.h leaking into it would fail this compile immediately.
 //
+// Run it twice — plain, and with -fpack-struct=1 for the AVR-like layout — plus once under a
+// g++ >= 9 (clang and GCC disagree about which portability mistakes are errors). Every wire size
+// and offset must come out the same; that is the cross-ABI guarantee HMTLWireFormat.h's packed
+// structs exist to provide.
+//
 // Exits 0 on success, 1 if any assertion failed.
 //
 #include "../rs485_bridge_protocol.h"
-#include <cstddef>   // offsetof — used to pin msg_poll_response_t, see group 1
+#include <cstddef>   // offsetof — used to pin every wire struct's field offsets, see group 1
 #include <cstdio>
 #include <cstring>
 
@@ -129,25 +137,55 @@ int main() {
     CHECK((size_t)((uint8_t *)&h.length  - (uint8_t *)&h) == 3, "length at offset 3");
     CHECK((size_t)((uint8_t *)&h.address - (uint8_t *)&h) == 6, "address at offset 6");
 
-    // msg_poll_response_t is the one wire struct rs485_bridge_protocol.h's static_assert block
-    // deliberately omits, because its *size* is ABI-dependent: config_hdr_t is 10 bytes with
-    // 1-byte alignment on AVR but 2-byte alignment wherever uint16_t demands it, so the struct
-    // ends up 15 B or 16 B. Only the trailing pad after msg_version differs — every field offset
-    // is identical on both ABIs. That was prose in the header and in the plan's hardware-test
-    // note; here it is executable. An upstream HMTLWireFormat.h edit that reorders, resizes or
-    // inserts a field would move one of these offsets and fail, while the legitimate padding
-    // difference stays inside the size bound. sendPollResponse() emits HMTL_MSG_POLL_MIN_LEN
-    // bytes laid out exactly this way, so this is what a legacy master parses.
+    // msg_poll_response_t used to be the one struct rs485_bridge_protocol.h's static_assert block
+    // exempted, because its size was ABI-dependent: config_hdr_t is 10 bytes and, unpacked, a
+    // 2-byte-aligned ABI added a trailing pad after msg_version, making the struct 15 B on AVR and
+    // 16 B here — so HMTL_MSG_POLL_MIN_LEN was 23 or 24 depending on which end of the bus you
+    // asked. HMTLWireFormat.h now packs every wire struct, so the sizes below are exact rather
+    // than bounded, and this test asserts the *same* numbers a legacy ATMega328 master would.
+    // Run it under -fpack-struct=1 too (see the plan's Test Plan): the AVR-like layout must give
+    // identical answers, which is the whole claim.
     CHECK(offsetof(msg_poll_response_t, config)           == 0,  "poll resp config at 0");
     CHECK(offsetof(msg_poll_response_t, object_type)      == 10, "poll resp object_type at 10");
     CHECK(offsetof(msg_poll_response_t, recv_buffer_size) == 12, "poll resp recv_buffer_size at 12");
     CHECK(offsetof(msg_poll_response_t, msg_version)      == 14, "poll resp msg_version at 14");
     CHECK(offsetof(msg_poll_response_t, data)             == 15, "poll resp data at 15");
-    CHECK(sizeof(msg_poll_response_t) == 15 || sizeof(msg_poll_response_t) == 16,
-          "poll resp is 15B (AVR) or 16B (2-byte-aligned ABIs) — trailing pad only");
-    // The wire length the bridge actually emits follows from the above: header + response.
+    CHECK(sizeof(msg_poll_response_t) == 15, "poll resp is 15B on every ABI (packed)");
+    // The wire length the bridge actually emits follows from the above: header + response = 23.
     CHECK(HMTL_MSG_POLL_MIN_LEN == sizeof(msg_hdr_t) + sizeof(msg_poll_response_t),
           "HMTL_MSG_POLL_MIN_LEN is msg_hdr_t + msg_poll_response_t");
+    CHECK(HMTL_MSG_POLL_MIN_LEN == 23, "poll response is 23B on every ABI");
+
+    // config_hdr_v2_t is the other struct the packing fixed, and it was the worse of the two:
+    // interior padding, not trailing. Unpacked it is 8 B with address at offset 3 on AVR but 10 B
+    // with address at offset 4 on a 32-bit target, so a v2 EEPROM blob written by a deployed
+    // module misparses when read through the struct here. Compile-time dead under
+    // HMTL_CONFIG_VERSION 3, pinned anyway because the blobs are not dead.
+    CHECK(sizeof(config_hdr_v2_t) == 8, "config_hdr_v2_t is 8B on every ABI (packed)");
+    CHECK(offsetof(config_hdr_v2_t, address)     == 3, "config v2 address at 3, no interior pad");
+    CHECK(offsetof(config_hdr_v2_t, reserved)    == 5, "config v2 reserved at 5");
+    CHECK(offsetof(config_hdr_v2_t, num_outputs) == 6, "config v2 num_outputs at 6");
+    CHECK(offsetof(config_hdr_v2_t, flags)       == 7, "config v2 flags at 7");
+
+    // Every remaining wire struct, so "all offsets match across ABIs" is executable rather than
+    // asserted in prose. Sizes are already static_asserted in rs485_bridge_protocol.h.
+    CHECK(offsetof(config_hdr_v3_t, device_id) == 6, "config v3 device_id at 6");
+    CHECK(offsetof(config_hdr_v3_t, address)   == 8, "config v3 address at 8");
+    CHECK(offsetof(msg_rgb_t, values)          == 2, "rgb values at 2");
+    CHECK(offsetof(msg_program_t, type)        == 2, "program type at 2");
+    CHECK(offsetof(msg_program_t, values)      == 3, "program values at 3");
+    CHECK(offsetof(msg_set_addr_t, address)    == 2, "set_addr address at 2");
+    CHECK(offsetof(msg_sensor_data_t, data)    == 2, "sensor data at 2");
+    CHECK(offsetof(output_hdr_t, output)       == 1, "output_hdr output at 1");
+
+    // Packing a struct that holds bitfields is the one case where the attribute could have moved
+    // more than padding, so check the 13/3 split at byte level rather than trusting sizeof.
+    msg_value_t mv; memset(&mv, 0, sizeof(mv));
+    mv.value = 0x1FFF;
+    const uint8_t *mvb = (const uint8_t *)&mv;
+    CHECK(mvb[2] == 0xFF && mvb[3] == 0x1F, "13-bit value fills bits 0..12 of the unit at offset 2");
+    mv.value = 0; mv.flags = 0x7;
+    CHECK(mvb[2] == 0x00 && mvb[3] == 0xE0, "3-bit flags occupy bits 13..15");
   }
 
   // 2) CRC-8 matches ArduinoLibs' EEPROM_crc (poly 0xD8, init 0, MSB-first).

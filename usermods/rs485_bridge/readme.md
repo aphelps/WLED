@@ -181,9 +181,15 @@ into bad frames, unsupported commands, transmit-queue drops and rejected datagra
 Pure protocol/decision logic is host-testable with no Arduino toolchain:
 
 ```bash
-c++ -std=c++11 -Wall -Wextra -o /tmp/rs485_test usermods/rs485_bridge/tests/rs485_bridge_test.cpp \
+# from the super-repo root
+c++ -std=c++11 -Wall -Wextra -I HMTL/Libraries/HMTLprotocol -I ArduinoLibs/Socket \
+  -o /tmp/rs485_test WLED/usermods/rs485_bridge/tests/rs485_bridge_test.cpp \
   && /tmp/rs485_test
 ```
+
+The two `-I` flags point at the *real* HMTL and ArduinoLibs headers, so this doubles as the
+acceptance check that `HMTLWireFormat.h` is genuinely dependency-free. Run it under a g++ >= 9 as
+well as clang — the two disagree about which host-portability mistakes are diagnosable.
 
 `tests/` is excluded from the firmware build via `library.json`'s `srcFilter`.
 
@@ -225,3 +231,38 @@ Build wiring: `${PROJECT_DIR}/../HMTL/Libraries` on `lib_extra_dirs` plus
 `${PROJECT_DIR}/../HMTL/Libraries/HMTLprotocol` in `lib_deps` (`[env:ampworks]`). `HMTLprotocol`
 carries a `library.json` declaring `espressif32`, which WLED's `lib_compat_mode = strict`
 requires.
+
+**Local-edit gotcha.** `lib_deps` names `HMTLprotocol` by `file://` path, so PlatformIO *copies*
+it into `.pio/libdeps/<env>/HMTLprotocol` and caches it by version. Editing
+`HMTL/Libraries/HMTLprotocol/HMTLWireFormat.h` in the submodule therefore has **no effect** on the
+next `pio run` until that copy is cleared:
+
+```bash
+rm -rf .pio/libdeps/*/HMTLprotocol && pio run -e ampworks
+```
+
+This matters because the wire-layout `static_assert`s below are the guard against an incompatible
+wire-format change — a stale copy silently checks the old layout. Fresh clones and CI copy the
+current file, so it only bites in-place development.
+
+### Wire structs are packed — sizes are the same on AVR and ESP32
+
+Every struct in `HMTLWireFormat.h` carries `__attribute__((__packed__))`, because an ATMega328
+module and this bridge talk to each other. Without it, `config_hdr_v2_t` is 8 B with `address` at
+offset 3 under avr-gcc but 10 B with `address` at offset 4 on a 32-bit target (interior padding),
+and `msg_poll_response_t` is 15 B versus 16 B, which made `HMTL_MSG_POLL_MIN_LEN` 23 or 24
+depending on which end of the bus you asked — so an AVR master length-checking a poll response
+against its own constant could reject a valid one from the bridge. Packing is layout-neutral under
+avr-gcc (alignment is already 1), so deployed modules are unaffected; it makes the ESP32 layout
+equal the AVR layout that is already on the wire.
+
+The consequence for this usermod is that a single set of constants is correct for both ends:
+`rs485_bridge_protocol.h`'s `static_assert` block pins every wire struct's size (there is no
+longer an ABI-dependent one to exempt) and `tests/rs485_bridge_test.cpp` group 1 pins every field
+offset. Run the host test under both alignment models to check the claim rather than assume it:
+
+```bash
+c++ -std=c++11 -Wall -Wextra -I ../../../HMTL/Libraries/HMTLprotocol -I ../../../ArduinoLibs/Socket \
+  -o /tmp/rs485_test tests/rs485_bridge_test.cpp && /tmp/rs485_test
+# and again with -fpack-struct=1 added, for the AVR-like layout
+```

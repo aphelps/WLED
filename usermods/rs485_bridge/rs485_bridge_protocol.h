@@ -205,8 +205,11 @@ static inline RS485BFrameResult rs485b_validate_udp_ingress(const uint8_t *buf, 
   RS485BFrameResult r = rs485b_validate(buf, len);
   if (r != RS485B_OK) return r;
   // Safe to read: rs485b_validate() has already established that a full header is present.
+  // msg_hdr_t::length is a uint8_t on the wire, so the 255 ceiling sendMsgTo's `byte` length
+  // imposes is enforced by the type itself — maxPayload is the only bound left to check. (An
+  // explicit `frameLen > 255` used to sit here; g++ -Wtype-limits correctly calls it dead.)
   uint8_t frameLen = buf[3];   // msg_hdr_t::length
-  if (frameLen > maxPayload || frameLen > 255) return RS485B_ERR_OVERSIZE;
+  if (frameLen > maxPayload) return RS485B_ERR_OVERSIZE;
   return RS485B_OK;
 }
 
@@ -541,23 +544,38 @@ struct RS485BCounters {
   }
 };
 
-// Compile-time wire-layout guards on the imported HMTL structs. Of the eight asserted here only
-// output_hdr_t carries __attribute__((__packed__)) in HMTLWireFormat.h; the other seven rely on
-// their field ordering happening to leave no interior padding on AVR, Xtensa and x86-64 alike. So
-// these assertions are what would catch a toolchain or an upstream edit that changed that, i.e.
-// that broke interoperability with deployed modules.
+// Compile-time wire-layout guards on the imported HMTL structs.
 //
-// msg_poll_response_t is deliberately absent: it is the one struct whose size is ABI-dependent
-// (15 bytes on AVR, 16 where uint16_t forces 2-byte alignment, from trailing padding only). Field
-// offsets are identical either way, and the bridge emits HMTL_MSG_POLL_MIN_LEN — exactly what
-// HMTL's own hmtl_poll_fmt() puts on the wire for the same target. The host test
-// (tests/rs485_bridge_test.cpp, group 1) pins its field offsets and bounds its size, so a layout
-// change that moves a field — as opposed to one that only alters trailing padding — still fails.
+// HMTLWireFormat.h declares every wire struct __attribute__((__packed__)), precisely so an
+// ATMega328 module and this ESP32 bridge — which share the bus and read each other's config
+// blobs — agree on every size and every field offset. Two structs really did differ before that:
+// config_hdr_v2_t was 8 B on AVR with address at offset 3 but 10 B with address at offset 4 on
+// 32-bit targets (interior padding), and msg_poll_response_t was 15 B versus 16 B (trailing),
+// which made HMTL_MSG_POLL_MIN_LEN 23 or 24 depending on the target. There is therefore no longer
+// an "ABI-dependent" struct here to exempt: every number below holds on avr-gcc, Xtensa and
+// x86-64 alike, so a single set of constants is correct for both ends of the wire.
+//
+// What these assertions still buy: they fail the firmware build if an upstream HMTLWireFormat.h
+// edit drops the packed attribute, reorders a field, or resizes one — i.e. if interoperability
+// with deployed modules breaks. Sizes are asserted here (offsetof is not usable in this header,
+// which must stay <stddef.h>-free for the flagless builds); tests/rs485_bridge_test.cpp group 1
+// pins the field offsets as well, and HMTL's own platformio/HMTL_Test/test/test_wire_format does
+// the same on the AVR side.
 static_assert(sizeof(msg_hdr_t)       == 8,  "HMTL msg_hdr_t must be 8 bytes on the wire");
 static_assert(sizeof(output_hdr_t)    == 2,  "HMTL output_hdr_t must be 2 bytes on the wire");
 static_assert(sizeof(msg_value_t)     == 4,  "HMTL msg_value_t must be 4 bytes on the wire");
 static_assert(sizeof(msg_rgb_t)       == 5,  "HMTL msg_rgb_t must be 5 bytes on the wire");
 static_assert(sizeof(msg_program_t)   == 35, "HMTL msg_program_t must be 35 bytes on the wire");
 static_assert(sizeof(msg_set_addr_t)  == 4,  "HMTL msg_set_addr_t must be 4 bytes on the wire");
+static_assert(sizeof(config_hdr_v1_t) == 5,  "HMTL config_hdr_v1_t must be 5 bytes on the wire");
+static_assert(sizeof(config_hdr_v2_t) == 8,  "HMTL config_hdr_v2_t must be 8 bytes on the wire");
 static_assert(sizeof(config_hdr_v3_t) == 10, "HMTL config_hdr_v3_t must be 10 bytes on the wire");
 static_assert(sizeof(msg_sensor_data_t) == 2, "HMTL msg_sensor_data_t header must be 2 bytes");
+static_assert(sizeof(msg_sensor_response_t) == 0, "HMTL msg_sensor_response_t must be a bare FAM");
+static_assert(sizeof(msg_dumpconfig_response_t) == 0,
+              "HMTL msg_dumpconfig_response_t must be a bare FAM");
+// The struct that used to be exempt, now pinned like the rest: 15 B, so the POLL response the
+// bridge emits is 23 B — byte-for-byte what a legacy AVR master builds and length-checks.
+static_assert(sizeof(msg_poll_response_t) == 15,
+              "HMTL msg_poll_response_t must be 15 bytes on the wire (packed, AVR-identical)");
+static_assert(HMTL_MSG_POLL_MIN_LEN == 23, "HMTL POLL response must be 23 bytes on every target");
