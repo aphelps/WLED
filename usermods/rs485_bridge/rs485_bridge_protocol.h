@@ -541,15 +541,18 @@ struct RS485BCounters {
   }
 };
 
-// Compile-time wire-layout guards on the imported HMTL structs. HMTL declares them without
-// __attribute__((packed)) — the field ordering happens to leave no interior padding on AVR,
-// Xtensa and x86-64 alike — so these assertions are what would catch a toolchain or an upstream
-// edit that changed that, i.e. that broke interoperability with deployed modules.
+// Compile-time wire-layout guards on the imported HMTL structs. Of the eight asserted here only
+// output_hdr_t carries __attribute__((__packed__)) in HMTLWireFormat.h; the other seven rely on
+// their field ordering happening to leave no interior padding on AVR, Xtensa and x86-64 alike. So
+// these assertions are what would catch a toolchain or an upstream edit that changed that, i.e.
+// that broke interoperability with deployed modules.
 //
 // msg_poll_response_t is deliberately absent: it is the one struct whose size is ABI-dependent
 // (15 bytes on AVR, 16 where uint16_t forces 2-byte alignment, from trailing padding only). Field
 // offsets are identical either way, and the bridge emits HMTL_MSG_POLL_MIN_LEN — exactly what
-// HMTL's own hmtl_poll_fmt() puts on the wire for the same target.
+// HMTL's own hmtl_poll_fmt() puts on the wire for the same target. The host test
+// (tests/rs485_bridge_test.cpp, group 1) pins its field offsets and bounds its size, so a layout
+// change that moves a field — as opposed to one that only alters trailing padding — still fails.
 static_assert(sizeof(msg_hdr_t)       == 8,  "HMTL msg_hdr_t must be 8 bytes on the wire");
 static_assert(sizeof(output_hdr_t)    == 2,  "HMTL output_hdr_t must be 2 bytes on the wire");
 static_assert(sizeof(msg_value_t)     == 4,  "HMTL msg_value_t must be 4 bytes on the wire");

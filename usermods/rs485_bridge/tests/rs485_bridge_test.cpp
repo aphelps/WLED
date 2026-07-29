@@ -15,6 +15,7 @@
 // Exits 0 on success, 1 if any assertion failed.
 //
 #include "../rs485_bridge_protocol.h"
+#include <cstddef>   // offsetof — used to pin msg_poll_response_t, see group 1
 #include <cstdio>
 #include <cstring>
 
@@ -127,6 +128,26 @@ int main() {
     msg_hdr_t h; memset(&h, 0, sizeof(h));
     CHECK((size_t)((uint8_t *)&h.length  - (uint8_t *)&h) == 3, "length at offset 3");
     CHECK((size_t)((uint8_t *)&h.address - (uint8_t *)&h) == 6, "address at offset 6");
+
+    // msg_poll_response_t is the one wire struct rs485_bridge_protocol.h's static_assert block
+    // deliberately omits, because its *size* is ABI-dependent: config_hdr_t is 10 bytes with
+    // 1-byte alignment on AVR but 2-byte alignment wherever uint16_t demands it, so the struct
+    // ends up 15 B or 16 B. Only the trailing pad after msg_version differs — every field offset
+    // is identical on both ABIs. That was prose in the header and in the plan's hardware-test
+    // note; here it is executable. An upstream HMTLWireFormat.h edit that reorders, resizes or
+    // inserts a field would move one of these offsets and fail, while the legitimate padding
+    // difference stays inside the size bound. sendPollResponse() emits HMTL_MSG_POLL_MIN_LEN
+    // bytes laid out exactly this way, so this is what a legacy master parses.
+    CHECK(offsetof(msg_poll_response_t, config)           == 0,  "poll resp config at 0");
+    CHECK(offsetof(msg_poll_response_t, object_type)      == 10, "poll resp object_type at 10");
+    CHECK(offsetof(msg_poll_response_t, recv_buffer_size) == 12, "poll resp recv_buffer_size at 12");
+    CHECK(offsetof(msg_poll_response_t, msg_version)      == 14, "poll resp msg_version at 14");
+    CHECK(offsetof(msg_poll_response_t, data)             == 15, "poll resp data at 15");
+    CHECK(sizeof(msg_poll_response_t) == 15 || sizeof(msg_poll_response_t) == 16,
+          "poll resp is 15B (AVR) or 16B (2-byte-aligned ABIs) — trailing pad only");
+    // The wire length the bridge actually emits follows from the above: header + response.
+    CHECK(HMTL_MSG_POLL_MIN_LEN == sizeof(msg_hdr_t) + sizeof(msg_poll_response_t),
+          "HMTL_MSG_POLL_MIN_LEN is msg_hdr_t + msg_poll_response_t");
   }
 
   // 2) CRC-8 matches ArduinoLibs' EEPROM_crc (poly 0xD8, init 0, MSB-first).
