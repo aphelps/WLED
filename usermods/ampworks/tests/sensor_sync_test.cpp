@@ -19,7 +19,7 @@ static int build_mask(uint8_t *buf, uint8_t sensorType, uint32_t dev, uint16_t s
   memcpy(h.magic, "AMPS", 4);
   h.version = SENSOR_SYNC_VERSION; h.msgType = SENSOR_SYNC_MSG_SNAPSHOT;
   h.sensorType = sensorType; h.dataLen = sizeof(SensorSnapshot);
-  h.deviceId = dev; h.seq = seq; h.reserved = 0; h.timestamp = 1000 + seq;
+  h.deviceId = dev; h.seq = seq; h.timestamp = 1000 + seq;  // h{} zero-inits ttl/flags
   SensorSnapshot s{mask};
   memcpy(buf, &h, sizeof(h)); memcpy(buf + sizeof(h), &s, sizeof(s));
   return sizeof(h) + sizeof(s);
@@ -30,7 +30,7 @@ static int build_sample(uint8_t *buf, uint8_t sensorType, uint32_t dev, uint16_t
   memcpy(h.magic, "AMPS", 4);
   h.version = SENSOR_SYNC_VERSION; h.msgType = SENSOR_SYNC_MSG_SNAPSHOT;
   h.sensorType = sensorType; h.dataLen = sizeof(SensorSample);
-  h.deviceId = dev; h.seq = seq; h.reserved = 0; h.timestamp = 2000 + seq;
+  h.deviceId = dev; h.seq = seq; h.timestamp = 2000 + seq;  // h{} zero-inits ttl/flags
   SensorSample s{ch, val};
   memcpy(buf, &h, sizeof(h)); memcpy(buf + sizeof(h), &s, sizeof(s));
   return sizeof(h) + sizeof(s);

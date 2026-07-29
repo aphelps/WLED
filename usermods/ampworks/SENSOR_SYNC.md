@@ -14,7 +14,7 @@ the installation's "touch on one device ripples across all devices" behavior.
 
 Design goals: sensor-agnostic (touch, switches, proximity, temperature, …), tolerant of packet
 loss (snapshot model self-heals), multi-consumer (several effects/segments each see every
-event), and transport-swappable (UDP today; ESP-NOW / multi-hop at milestone M3).
+event), and transport-swappable (UDP, ESP-NOW single-hop, or multi-hop via the router tier).
 
 ## File map
 
@@ -35,8 +35,14 @@ Every datagram is a 20-byte `SensorSyncHeader` followed by a per-type data struc
 
 ```
 SensorSyncHeader (20B): magic "AMPS" | version | msgType | sensorType | dataLen
-                        | deviceId(u32) | seq(u16) | reserved(u16) | timestamp(u32)
+                        | deviceId(u32) | seq(u16) | ttl(u8) | flags(u8) | timestamp(u32)
 ```
+
+`msgType` is `SENSOR_SYNC_MSG_SNAPSHOT` (0) for sensor data; `SENSOR_SYNC_MSG_BEACON` (1) is a
+router-only leader-election beacon (edges reject it via `ss_parse_header`'s msgType check). The
+`ttl`/`flags` bytes occupy the former `reserved` u16 — still v5, still 20 bytes; legacy senders
+zeroed `reserved`, so old frames arrive `ttl=0` (a relay injects the default). See **Multi-hop
+backbone** below.
 
 | `sensorType` | payload | semantics |
 |--------------|---------|-----------|
@@ -133,10 +139,11 @@ ss->publishSample(SS_SENSOR_TEMP, channel, centiDeg); // scalar sensors (deliver
 
 ## Transport seam
 
-`ISensorTransport { begin/end/broadcast/poll }` isolates the wire. `UdpSensorTransport` is the
-current impl (UDP limited broadcast; packet-boundary handling stays inside it). Milestone **M3**
-adds an ESP-NOW / multi-hop implementation behind the same interface — producers, consumers, and
-dispatch don't change.
+`ISensorTransport { begin/end/broadcast/poll }` isolates the wire. Two implementations sit behind
+it: `UdpSensorTransport` (UDP limited broadcast, the default) and `EspNowSensorTransport` (ESP-NOW
+broadcast, selected by the `useEspNow` config); multi-hop delivery is layered on by the router
+tier. Packet-boundary handling stays inside each implementation, so producers, consumers, and
+dispatch are unaffected by the choice.
 
 ## Testing
 
@@ -157,6 +164,31 @@ verification is tracked as `## Testing Required` on the task.
   `publish*` call from the producer. No header/version change if the layout is unchanged.
 - **New consumer:** look up the usermod, `subscribe()` once (store the cursor in your effect's
   state), `drain()` each frame. Filter by `sensorType`/`channel`.
+
+## Multi-hop backbone
+
+Single-hop ESP-NOW only reaches edges in direct radio range. A tier of dedicated
+non-WLED **router** nodes relays `AMPS` frames multi-hop, so an event injected at one edge
+reaches every edge even across an installation. The router firmware lives in its own repo
+(`esp-now-router`, a sibling submodule of `WLED_dev`) and includes this header directly, so the
+wire format cannot drift.
+
+The router-only helpers (`ss_router_should_relay`, `ss_router_relay_slot`,
+`ss_router_beacon_better`, `SensorRouterPeer`) live in the router repo
+(`esp-now-router/src/router_relay.h`), not in this header — the edge firmware never calls them.
+They are tested from that repo (`esp-now-router/tests/`); this repo's host tests cover the edge
+dispatch it uses. Only the wire format is shared.
+
+- **Relay** — `ss_router_should_relay(header, selfId, seenTable, n, &outTtl)` (pure, host-tested): a
+  loop-free flood. Per-origin `seq` dedup (`ss_seq_newer`) terminates loops; `ttl` (origin stamps
+  `SS_DEFAULT_TTL`, each hop decrements, drop at ≤1) bounds diameter; a self-origin frame is never
+  relayed. Frames arriving with `ttl==0` (a sender predating the field) get the default injected, so they still propagate.
+- **Leader election** — routers beacon `{uptimeTicks, term}` (`SENSOR_SYNC_MSG_BEACON`);
+  `ss_router_beacon_better` picks the highest `(uptimeTicks, deviceId)` as timebase leader, with
+  step-down + reassert. Degenerates cleanly to a single router.
+
+Router design + go/no-go notes and the relay/election host tests live in the `esp-now-router` repo
+(`BACKBONE_ROUTER.md`, `tests/`).
 
 ## Maintenance
 

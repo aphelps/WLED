@@ -13,11 +13,26 @@
 // older builds interoperate for touch. New sensor types are additive — a peer that doesn't know
 // a sensorType simply ignores it (ss_dispatch drops unknown types).
 //
+// Routing fields: the header's `ttl` + `flags` bytes occupy what was a 16-bit `reserved` padding
+// word, so they carry routing state without changing the version. Senders that predate the split
+// zeroed `reserved`, so their frames arrive as ttl=0/flags=0 — the router relay logic reads ttl==0
+// as "unset" and injects SS_DEFAULT_TTL, so those frames still relay. The version stays 5
+// deliberately: `ss_parse_header`/`ss_is_our_frame` gate on version==5, so raising it would break
+// interoperation across the whole touch path.
+//
 #include <stdint.h>
 #include <string.h>
 
 #define SENSOR_SYNC_VERSION      5   // wire protocol version (32-bit deviceId; additive types)
 #define SENSOR_SYNC_MSG_SNAPSHOT 0   // msgType: a full sensor-state snapshot
+#define SENSOR_SYNC_MSG_BEACON   1   // msgType: router leader-election beacon (routers only)
+
+// Multi-hop relay. TTL bounds flood diameter; per-origin seq dedup terminates loops. The
+// origin stamps SS_DEFAULT_TTL; each relay re-broadcasts with ttl-1 and drops once ttl would reach 0.
+#define SS_DEFAULT_TTL           8    // max hops from origin (mesh diameter budget)
+#define SS_FLAG_RELAYED          0x01 // diagnostics-only: a router sets this on frames it re-broadcast.
+                                       // NOT consumed by relay/dispatch (dedup+ttl handle loops); it
+                                       // exists purely so a sniffer can tell origin frames from relays.
 
 // Sensor type tags. TOUCH/SWITCH carry a 16-bit channel bitmask; PROXIMITY/TEMP carry a
 // per-channel scalar sample (no edge derivation — the level/reading is delivered as-is).
@@ -35,7 +50,8 @@ struct __attribute__((packed)) SensorSyncHeader {
   uint8_t  dataLen;    // number of sensor-data bytes following the header
   uint32_t deviceId;   // origin device id (32-bit MAC hash)
   uint16_t seq;        // per-sender sequence number (dedup / loss tracking)
-  uint16_t reserved;   // padding; reserved
+  uint8_t  ttl;        // remaining hops (0 = unset, e.g. a pre-routing sender; relay injects default)
+  uint8_t  flags;      // SS_FLAG_* bits (0 from senders that predate the field)
   uint32_t timestamp;  // millis()+timebase at origin
 };
 
@@ -115,6 +131,14 @@ static inline void ss_sink_push(SensorEventSink &s, const RemoteSensorEvent &e) 
 static inline bool ss_seq_newer(uint16_t a, uint16_t b) {
   return (int16_t)(a - b) > 0;
 }
+
+// --- Routing logic lives in the router repo ---------------------------------------------------
+// The relay + leader-election LOGIC (ss_router_should_relay / ss_router_relay_slot /
+// SensorRouterPeer / ss_router_beacon_better / RouterBeacon) is NOT here — the WLED edge never
+// calls it. It lives in the esp-now-router repo (`src/router_relay.h`), which includes this header
+// for the shared wire types. Only the on-the-wire *format* stays shared: the SensorSyncHeader
+// ttl/flags fields, SS_DEFAULT_TTL (the edge sender stamps it), and the reserved msgType/flag
+// numbers (SENSOR_SYNC_MSG_BEACON, SS_FLAG_RELAYED) above.
 
 // Find (or allocate) the peer slot for dev. Reuses a free slot; if full, evicts the peer with
 // the oldest lastSeq activity is not tracked here, so evict slot 0 (documented resync-from-0).
