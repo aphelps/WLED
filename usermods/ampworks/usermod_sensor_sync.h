@@ -16,8 +16,8 @@
  * Architecture overview + send/receive flow charts: see SENSOR_SYNC.md (keep it in sync).
  *
  * The wire format + dispatch logic live in the dependency-free sensor_sync_protocol.h (host
- * unit-tested). This class wires that to a transport (UDP now; ESP-NOW later via ISensorTransport)
- * and to the effect layer.
+ * unit-tested). This class wires that to a transport (UDP or ESP-NOW, both behind
+ * ISensorTransport) and to the effect layer.
  *
  * Producer API (any usermod/effect can publish onto the bus):
  *   ss->publishSnapshot(SS_SENSOR_SWITCH, mask);          // bitmask sensors (edge-derived)
@@ -34,8 +34,8 @@
  * 0 = auto from MAC), keyframeMs (periodic full-snapshot re-broadcast; 0 = off).
  */
 
-// Minimal transport seam: broadcast one datagram, or poll the next received one. UDP-specific
-// packet-boundary handling stays inside the implementation; M3 adds an ESP-NOW impl.
+// Minimal transport seam: broadcast one datagram, or poll the next received one. Transport-specific
+// packet-boundary handling stays inside each implementation (UDP and ESP-NOW, below).
 struct ISensorTransport {
   virtual ~ISensorTransport() {}
   virtual bool begin(uint16_t port) = 0;
@@ -135,8 +135,8 @@ class UsermodSensorSync : public Usermod {
   uint32_t keyframeMs = 3000;    // periodic full-snapshot re-broadcast (0 = off)
   bool     useEspNow  = false;   // false = UDP (default, unchanged behavior); true = ESP-NOW
 
-  // Both transports are owned; `transport` points at the active one (defaults to UDP so the
-  // out-of-box behavior is byte-for-byte the pre-M3a UDP path). Selection swaps the pointer.
+  // Both transports are owned; `transport` points at the active one (defaults to UDP, so an
+  // unconfigured device broadcasts over UDP). Selection swaps the pointer.
   UdpSensorTransport udpTransport;
 #ifndef WLED_DISABLE_ESPNOW
   EspNowSensorTransport espNowTransport;

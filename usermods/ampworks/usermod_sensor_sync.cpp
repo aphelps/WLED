@@ -39,7 +39,7 @@ int UdpSensorTransport::poll(uint8_t *buf, int maxLen) {
 }
 
 // ---------------------------------------------------------------------------
-// ESP-NOW transport (M3a — single-hop broadcast; drop-in behind ISensorTransport)
+// ESP-NOW transport (single-hop broadcast; drop-in behind ISensorTransport)
 // ---------------------------------------------------------------------------
 #ifndef WLED_DISABLE_ESPNOW
 bool EspNowSensorTransport::begin(uint16_t port) {
@@ -126,7 +126,8 @@ bool UsermodSensorSync::sendMessage(uint8_t sensorType, const uint8_t *data, uin
   h.dataLen    = dataLen;
   h.deviceId   = deviceId;
   h.seq        = txSeq++;
-  h.reserved   = 0;
+  h.ttl        = SS_DEFAULT_TTL;   // origin stamps the hop budget so routers can relay
+  h.flags      = 0;
   h.timestamp  = millis() + strip.timebase;
   memcpy(buf, &h, sizeof(h));
   memcpy(buf + sizeof(h), data, dataLen);
@@ -225,7 +226,7 @@ void UsermodSensorSync::addToConfig(JsonObject &root) {
   top["port"]       = port;
   top["id"]         = configId;
   top["keyframeMs"] = keyframeMs;
-  top["useEspNow"]  = useEspNow;   // false = UDP (default); true = ESP-NOW broadcast (M3a)
+  top["useEspNow"]  = useEspNow;   // false = UDP (default); true = ESP-NOW broadcast
 }
 
 bool UsermodSensorSync::readFromConfig(JsonObject &root) {
