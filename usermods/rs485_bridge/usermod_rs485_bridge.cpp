@@ -124,6 +124,21 @@ void UsermodRS485Bridge::setup() {
   // RS485Socket::setup() skips serial->begin() under ESP32, so it will not undo the settings.
   rs485.init(port, (byte)enPin, address, RS485_RECV_BUFFER, false);
   rs485.setup();
+
+  // RS485Socket::setup() is where the receive buffer is allocated, and that allocation can fail —
+  // silently, and in the worst possible way: RS485::update() simply returns false forever, so the
+  // bridge would transmit happily while never receiving a single frame, with /json/info reporting
+  // itself healthy. Ask the socket whether it actually came up (initialized() covers the serial, the
+  // channel object and the channel's buffer) and refuse to run if it did not, so the failure shows up
+  // as `error: rs485 alloc failed` instead of a bridge that looks fine and is deaf.
+  if (!rs485.initialized()) {
+    failReason = PSTR("rs485 alloc failed");
+    releasePins();
+    delete port;
+    port = nullptr;
+    DEBUG_PRINTF_P(PSTR("[RS485Bridge] disabled: %s\n"), failReason);
+    return;
+  }
   // initBuffer() carves rawTxBuf into [socket header][data] and returns a pointer to the data
   // region. sendMsgTo() writes its header immediately in front of the pointer it is given, so
   // transmissions must go through this pointer and no other.
@@ -172,8 +187,22 @@ void UsermodRS485Bridge::serviceRs485() {
     // RS485_ADDR_ANY: take every frame off the bus, then decide locally whether it is ours.
     // Frames for other nodes are still useful — they are relayed back to the WiFi peer, which is
     // what lets a WiFi client observe replies from the legacy modules it commanded.
+    // RS485Utils now validates the socket-layer length itself (those checks used to be compiled out
+    // of release builds), which means a NULL return no longer implies "bus empty" — it can also mean
+    // "a frame arrived and was rejected". Distinguishing them keeps the info-page counters honest and
+    // keeps the drain loop going: treating a rejection as an empty bus would abandon the rest of this
+    // pass's budget and, worse, make a stream of malformed frames indistinguishable from silence
+    // during bring-up.
+    const unsigned long rejectsBefore = rs485.getRejectCount();
     const byte *data = rs485.getMsg(RS485_ADDR_ANY, &retlen);
-    if (data == nullptr) return;
+    if (data == nullptr) {
+      if (rs485.getRejectCount() != rejectsBefore) {
+        counters.rs485Rx++;                      // it did arrive; it just wasn't usable
+        counters.countError(RS485B_ERR_SHORT);
+        continue;
+      }
+      return;                                    // genuinely nothing waiting
+    }
 
     counters.rs485Rx++;
 
