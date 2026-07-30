@@ -153,6 +153,62 @@ static inline uint8_t rs485b_hmtl_fmt(uint8_t *buf, uint16_t bufSize, uint16_t a
 }
 
 // ---------------------------------------------------------------------------------------------
+// Poll response
+// ---------------------------------------------------------------------------------------------
+// This node's identity, as a poll response advertises it. Grouped into a struct on purpose: the
+// builder below needs both this node's address and the requester's, and two bare adjacent uint16_t
+// parameters could be transposed at the call site with nothing to catch it — the header address and
+// the config address would swap, every value would still look plausible, and the host test would stay
+// green. Naming them apart makes that impossible to write by accident.
+struct RS485BPollInfo {
+  uint16_t selfAddr;    // this node's RS485 address — goes in the CONFIG block
+  uint16_t deviceId;    // stable per-device id
+  uint32_t baud;        // encoded as units of 1200 by BAUD_TO_BYTE
+  uint16_t recvBuffer;  // whole-frame receive budget (NOT the sendable payload, which is 7 less)
+};
+
+// Build the HMTL_MSG_POLL_MIN_LEN-byte response to a poll from `requesterAddr`.
+//
+// The header address is the REQUESTER's, matching HMTL's own hmtl_poll_fmt (MessageHandler.cpp:118-131
+// -> HMTLMessaging.cpp:313). Getting that wrong is not cosmetic: MessageHandler.cpp:78-79 gates every
+// received frame on `msg_hdr->address == address || == SOCKET_ADDR_ANY` with no else-branch, so a
+// stock HMTL_Module silently discards a response addressed to the sender's own address.
+//
+// Returns the frame length, or 0 if `buf` is too small.
+static inline uint8_t rs485b_build_poll_response(uint8_t *buf, uint16_t bufSize,
+                                                 uint16_t requesterAddr,
+                                                 const RS485BPollInfo &info) {
+  const uint8_t len = (uint8_t)HMTL_MSG_POLL_MIN_LEN;
+  if (bufSize < len) return 0;
+  // ACK marks this as a response to a poll rather than a poll of our own.
+  if (!rs485b_hmtl_fmt(buf, bufSize, requesterAddr, len, MSG_TYPE_POLL, MSG_FLAG_ACK)) return 0;
+
+  msg_poll_response_t resp;
+  memset(&resp, 0, sizeof(resp));   // zero first: every reserved/unused field goes out as 0
+  resp.config.magic            = HMTL_CONFIG_MAGIC;
+  resp.config.protocol_version = HMTL_CONFIG_VERSION;
+  resp.config.hardware_version = 1;
+  resp.config.baud             = BAUD_TO_BYTE(info.baud);
+  resp.config.num_outputs      = 1;   // the bridge presents the strip as a single HMTL output
+  resp.config.flags            = 0;
+  resp.config.device_id        = info.deviceId;
+  resp.config.address          = info.selfAddr;
+  resp.object_type             = HMTL_OBJECT_TYPE_WLED;
+  // The WHOLE-frame budget, per the HMTL wire format — not the sendable payload, which is 7 bytes
+  // less once the socket header is counted. A master that reads 64 here and sends a 64-byte payload
+  // gets RS485B_ERR_OVERSIZE from the node that advertised it. That is the format's conflation, not
+  // ours, so the value stays as-is; the readme's message table carries the same caveat.
+  resp.recv_buffer_size        = info.recvBuffer;
+  resp.msg_version             = HMTL_MSG_VERSION;
+  memcpy(buf + sizeof(msg_hdr_t), &resp, sizeof(resp));
+
+  // The CRC covers header AND payload, but rs485b_hmtl_fmt() ran before the payload was written, so
+  // its stamp is stale. Re-stamp now or the response fails validation at any CRC-checking receiver.
+  buf[1] = rs485b_hmtl_crc(buf, len);
+  return len;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Frame validation
 // ---------------------------------------------------------------------------------------------
 enum RS485BFrameResult : uint8_t {
@@ -245,7 +301,13 @@ static inline bool rs485b_addressed_to(uint16_t msgAddr, uint16_t selfAddr) {
 // ---------------------------------------------------------------------------------------------
 enum RS485BAction : uint8_t {
   RS485B_ACT_DROP = 0,     // malformed — see RS485BDecision::err
-  RS485B_ACT_RELAY_ONLY,   // well-formed but addressed elsewhere: relay to the WiFi peer only
+  // Relay to the WiFi peer and do nothing locally. Two distinct cases reach this:
+  //   * the frame is addressed elsewhere — the bridge listens promiscuously so it can mirror the bus
+  //   * the frame is addressed to us but is a RESPONSE (MSG_FLAG_ACK), which the peer asked for and we
+  //     must not act on. Answering a response is what the ACK guard below exists to prevent.
+  // Counting note, because the bring-up runbook reads these numbers: handleDecision() returns before
+  // rs485Handled++, so a relayed frame bumps `relayed` only — not handled, not unsupported.
+  RS485B_ACT_RELAY_ONLY,
   RS485B_ACT_UNSUPPORTED,  // addressed to us but not in the v1 command set: count and ignore
   RS485B_ACT_SET_RGB,
   RS485B_ACT_SET_VALUE,
@@ -260,7 +322,11 @@ struct RS485BDecision {
   RS485BFrameResult err;          // meaningful when action == RS485B_ACT_DROP
   uint16_t          destAddress;  // hdr.address as received
   uint8_t           output;       // HMTL output index, or HMTL_ALL_OUTPUTS
-  bool              wantsResponse;
+  bool              wantsResponse;  // MSG_FLAG_RESPONSE: the sender wants an answer
+  // MSG_FLAG_ACK: this frame IS an answer. Lifted out of the switch the same way wantsResponse is, so
+  // the distinction is named once rather than re-derived per case — and so a test can assert it
+  // directly. Every ACK-bearing type the bridge sees (POLL, SENSOR, DUMP_CONFIG) can consult this.
+  bool              isResponse;
   uint8_t           rgb[3];       // SET_RGB
   uint16_t          value;        // SET_VALUE (0..8191)
   uint8_t           programType;  // PROGRAM: HMTL_PROGRAM_*
@@ -303,6 +369,10 @@ static inline RS485BDecision rs485b_decide(const uint8_t *buf, uint16_t avail,
   memcpy(&h, buf, sizeof(h));
   d.destAddress   = h.address;
   d.wantsResponse = (h.flags & MSG_FLAG_RESPONSE) != 0;
+  // Mask, not equality: a poll response carries the request's flags ORed with ACK (hmtl_poll_fmt), so
+  // a real one arrives as ACK|RESPONSE == 0x03. `flags == MSG_FLAG_ACK` would be false on every frame
+  // an actual HMTL node sends.
+  d.isResponse    = (h.flags & MSG_FLAG_ACK) != 0;
 
   // Frames for other nodes are not errors — the bridge listens promiscuously (RS485_ADDR_ANY) so
   // it can mirror the whole bus back to the WiFi peer. They just get no local handling.
@@ -356,6 +426,17 @@ static inline RS485BDecision rs485b_decide(const uint8_t *buf, uint16_t avail,
     case MSG_TYPE_POLL:
       // A poll needs no payload — the caller answers with this node's config block so a master
       // can enumerate the bus.
+      //
+      // ...unless it is itself an answer. A module replies to a poll by sending its response to the
+      // poll's SOCKET-layer source address — ours — with MSG_FLAG_ACK set (MessageHandler.cpp:118-148,
+      // hmtl_poll_fmt at HMTLMessaging.cpp:314). So a response arrives addressed to this node and,
+      // without this guard, decodes as a fresh request: the bridge answers the answer, the WiFi client
+      // that asked never sees it, and the bus eats an extra frame each time.
+      //
+      // Broadcast responses relay too, deliberately diverging from stock HMTL. MessageHandler.cpp:81-82
+      // skips its own ACK short-circuit when address == SOCKET_ADDR_ANY, so a module WOULD answer such a
+      // frame. A bridge must not: every node on the bus answering one broadcast ACK is a poll storm.
+      if (d.isResponse) { d.action = RS485B_ACT_RELAY_ONLY; return d; }
       d.action = RS485B_ACT_POLL;
       return d;
 

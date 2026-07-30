@@ -369,11 +369,76 @@ int main() {
 
   // 11) POLL is answered; the RESPONSE flag is surfaced.
   {
+    // A poll REQUEST is answered. Unchanged behaviour; kept adjacent to the response case below so
+    // the two are read together.
     uint8_t len = build_hdr(buf, SELF_ADDR, sizeof(msg_hdr_t), MSG_TYPE_POLL,
                             MSG_FLAG_RESPONSE);
     RS485BDecision d = rs485b_decide(buf, len, SELF_ADDR, SELF_DEV);
-    CHECK(d.action == RS485B_ACT_POLL, "poll -> POLL");
+    CHECK(d.action == RS485B_ACT_POLL, "poll request -> POLL");
     CHECK(d.wantsResponse, "RESPONSE flag decoded");
+    CHECK(!d.isResponse, "a request is not a response");
+
+    // A poll RESPONSE is relayed, never answered.
+    //
+    // Built with ACK|RESPONSE because that is what a real one carries: hmtl_poll_fmt ORs the request's
+    // flags in beside ACK (HMTLMessaging.cpp:314), and a request sets RESPONSE — so a genuine response
+    // arrives as 0x03. A test using bare MSG_FLAG_ACK would be satisfied by a guard written
+    // `flags == MSG_FLAG_ACK`, which is false on every frame an HMTL node actually sends.
+    //
+    // Why this matters: a module answers a poll by sending to the poll's SOCKET-layer source — us —
+    // so without the guard its answer decodes as a fresh request and the bridge answers the answer.
+    len = build_hdr(buf, SELF_ADDR, sizeof(msg_hdr_t), MSG_TYPE_POLL,
+                    (uint8_t)(MSG_FLAG_ACK | MSG_FLAG_RESPONSE));
+    d = rs485b_decide(buf, len, SELF_ADDR, SELF_DEV);
+    CHECK(d.isResponse, "ACK decoded as isResponse");
+    CHECK(d.action == RS485B_ACT_RELAY_ONLY, "poll response addressed to us -> RELAY_ONLY, not POLL");
+
+    // ...including when broadcast. This is a deliberate divergence from stock HMTL, which skips its
+    // own ACK short-circuit for SOCKET_ADDR_ANY (MessageHandler.cpp:81-82) and would answer. If the
+    // bridge did too, one broadcast ACK would have every node on the bus replying at once.
+    len = build_hdr(buf, SOCKET_ADDR_ANY, sizeof(msg_hdr_t), MSG_TYPE_POLL,
+                    (uint8_t)(MSG_FLAG_ACK | MSG_FLAG_RESPONSE));
+    d = rs485b_decide(buf, len, SELF_ADDR, SELF_DEV);
+    CHECK(d.action == RS485B_ACT_RELAY_ONLY, "broadcast poll response -> RELAY_ONLY (no poll storm)");
+
+    // A broadcast poll REQUEST is still answered — the guard must not break bus enumeration.
+    len = build_hdr(buf, SOCKET_ADDR_ANY, sizeof(msg_hdr_t), MSG_TYPE_POLL, MSG_FLAG_RESPONSE);
+    d = rs485b_decide(buf, len, SELF_ADDR, SELF_DEV);
+    CHECK(d.action == RS485B_ACT_POLL, "broadcast poll request is still answered");
+  }
+
+  // 11b) The poll response the bridge builds is addressed to the REQUESTER, not to itself.
+  //
+  // Asserted whole rather than by its header address alone: the builder also fills the config block,
+  // sets ACK, fixes the length and re-stamps the CRC over header+payload, and a regression in any of
+  // those would otherwise pass unnoticed. Self and requester are deliberately DIFFERENT values so a
+  // transposed pair is visible — that is what the RS485BPollInfo struct exists to prevent.
+  {
+    const uint16_t REQUESTER = 0x0042;
+    const RS485BPollInfo info = { SELF_ADDR, SELF_DEV, 28000, RS485B_RECV_BUFFER_LEN };
+    uint8_t out[HMTL_MSG_POLL_MIN_LEN];
+    uint8_t len = rs485b_build_poll_response(out, sizeof(out), REQUESTER, info);
+    CHECK(len == HMTL_MSG_POLL_MIN_LEN, "poll response is 23 bytes");
+
+    msg_hdr_t h; memcpy(&h, out, sizeof(h));
+    CHECK(h.address == REQUESTER, "header carries the REQUESTER's address");
+    CHECK(h.address != SELF_ADDR, "...which is not our own (the bug this fixes)");
+    CHECK(h.type == MSG_TYPE_POLL, "type is POLL");
+    CHECK((h.flags & MSG_FLAG_ACK) != 0, "ACK is set: this is a response");
+    CHECK(h.length == HMTL_MSG_POLL_MIN_LEN, "declared length matches");
+    // Validation covers the CRC re-stamp: rs485b_hmtl_fmt runs before the payload exists, so a build
+    // that forgot to re-stamp would fail here at any CRC-checking receiver.
+    CHECK(rs485b_validate(out, len) == RS485B_OK, "response validates, CRC included");
+
+    msg_poll_response_t resp;
+    memcpy(&resp, out + sizeof(msg_hdr_t), sizeof(resp));
+    CHECK(resp.config.address == SELF_ADDR, "config block carries OUR address, not the requester's");
+    CHECK(resp.config.device_id == SELF_DEV, "device id");
+    CHECK(resp.config.magic == HMTL_CONFIG_MAGIC, "config magic");
+    CHECK(resp.config.baud == BAUD_TO_BYTE(28000), "baud encoded in units of 1200");
+    CHECK(resp.object_type == HMTL_OBJECT_TYPE_WLED, "object type marks a WLED bridge");
+    CHECK(resp.recv_buffer_size == RS485B_RECV_BUFFER_LEN, "advertised whole-frame budget");
+    CHECK(resp.msg_version == HMTL_MSG_VERSION, "message version");
   }
 
   // 12) SET_ADDRESS honours the device-id filter.
