@@ -459,34 +459,23 @@ void UsermodRS485Bridge::applyProgram(const RS485BDecision &d) {
 // one from the bridge. HMTLWireFormat.h now packs every wire struct, so the two agree; see the
 // static_assert block in rs485_bridge_protocol.h.
 void UsermodRS485Bridge::sendPollResponse(uint16_t to) {
-  const uint8_t len = (uint8_t)HMTL_MSG_POLL_MIN_LEN;
-  uint8_t frame[HMTL_MSG_POLL_MIN_LEN];
-  // ACK marks this as a response to a poll rather than a poll of our own.
-  if (!rs485b_hmtl_fmt(frame, sizeof(frame), address, len, MSG_TYPE_POLL,
-                       MSG_FLAG_ACK)) return;
+  // Never answer the broadcast address. The socket-layer source is taken raw off the wire
+  // (serviceRs485 -> sourceFromData, which validates nothing), so an unconfigured module with a blank
+  // EEPROM polls us with source 0xFFFF. Answering it would put an ACK'd poll response on the bus
+  // addressed to SOCKET_ADDR_ANY — and MessageHandler.cpp:81-82 skips its ACK short-circuit precisely
+  // for that address, so every stock module would treat it as a fresh poll and answer, each after
+  // delay(address * 2). One malformed source address, one bus-wide poll storm.
+  if (!rs485b_should_answer_poll(to)) { counters.pollRefused++; return; }
 
-  msg_poll_response_t resp;
-  memset(&resp, 0, sizeof(resp));   // zero first: every reserved/unused field goes out as 0
-  resp.config.magic            = HMTL_CONFIG_MAGIC;
-  resp.config.protocol_version = HMTL_CONFIG_VERSION;
-  resp.config.hardware_version = 1;
-  resp.config.baud             = BAUD_TO_BYTE(baud);
-  resp.config.num_outputs      = 1;   // the bridge presents the strip as a single HMTL output
-  resp.config.flags            = 0;
-  resp.config.device_id        = effectiveDeviceId();
-  resp.config.address          = address;
-  resp.object_type             = HMTL_OBJECT_TYPE_WLED;
-  // The WHOLE-frame budget, per the HMTL wire format -- not the sendable payload, which is 7 bytes
-  // less once the socket header is counted. A master that reads 64 here and sends a 64-byte payload
-  // gets RS485B_ERR_OVERSIZE from the node that advertised it. That is the format's conflation, not
-  // ours, so the value stays as-is; the readme's message table carries the same caveat.
-  resp.recv_buffer_size        = RS485_RECV_BUFFER;
-  resp.msg_version             = HMTL_MSG_VERSION;
-  memcpy(frame + sizeof(msg_hdr_t), &resp, sizeof(resp));
-  // The CRC covers header AND payload, but rs485b_hmtl_fmt() ran before the payload was written,
-  // so its stamp is stale. Re-stamp now or the response fails validation at any CRC-checking
-  // receiver.
-  frame[1] = rs485b_hmtl_crc(frame, len);
+  uint8_t frame[HMTL_MSG_POLL_MIN_LEN];
+  const RS485BPollInfo info = { address, effectiveDeviceId(), baud, RS485_RECV_BUFFER };
+  // The header carries the REQUESTER's address, not ours — see rs485b_build_poll_response(). A stock
+  // HMTL_Module discards a response addressed to the sender's own address.
+  const uint8_t len = rs485b_build_poll_response(frame, sizeof(frame), to, info);
+  // Count a build failure too. It should be unreachable (the buffer is sized from the same constant
+  // the builder checks), but an uncounted early return is invisible, and the bail above now has a
+  // counter — leaving this one silent would be an odd asymmetry to debug around.
+  if (!len) { counters.pollRefused++; return; }
 
   // Goes through the normal transmit queue rather than straight to the wire: a poll response is
   // subject to the same one-frame-per-loop() rate limit as anything else.
@@ -558,16 +547,20 @@ void UsermodRS485Bridge::addToJsonInfo(JsonObject &root) {
     // termination rather than at anything in software.
     const uint16_t framing = rs485.getFramingErrorCount();
     if (errs || counters.unsupported || counters.txDropped || counters.udpRejected || timeouts ||
-        framing) {
+        framing || counters.pollRefused) {
       JsonArray bad = user.createNestedArray(F("RS485 dropped"));
       bad.add(errs);
-      // 128, not 80: five counters plus the literal already ran close enough to 80 that a wide value
-      // would have been truncated, and snprintf_P truncates silently rather than erroring.
-      char buf3[128];
+      // 160, not 80. The original 80 could already truncate at four counters (worst case 84), and each
+      // added figure eats ~20 more; at seven the worst case is 124, which fits 128 with four bytes to
+      // spare — too little to survive the next addition, and snprintf_P truncates silently rather than
+      // erroring, so the failure would be a quietly short info row nobody notices.
+      char buf3[160];
       snprintf_P(buf3, sizeof(buf3),
-                 PSTR(" bad, %u unsupported, %u tx-drop, %u udp-rej, %u timeout, %u framing"),
+                 PSTR(" bad, %u unsupported, %u tx-drop, %u udp-rej, %u timeout, %u framing, "
+                      "%u poll-refused"),
                  (unsigned)counters.unsupported, (unsigned)counters.txDropped,
-                 (unsigned)counters.udpRejected, (unsigned)timeouts, (unsigned)framing);
+                 (unsigned)counters.udpRejected, (unsigned)timeouts, (unsigned)framing,
+                 (unsigned)counters.pollRefused);
       bad.add(buf3);
     }
   }
