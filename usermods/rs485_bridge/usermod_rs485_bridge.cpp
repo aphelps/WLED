@@ -11,21 +11,31 @@ static_assert(RS485B_WLED_MODE_FADE    == FX_MODE_FADE,        "FX_MODE_FADE ren
 static_assert(RS485B_WLED_MODE_SPARKLE == FX_MODE_SPARKLE,     "FX_MODE_SPARKLE renumbered");
 static_assert(RS485B_WLED_MODE_CHASE   == FX_MODE_CHASE_COLOR, "FX_MODE_CHASE_COLOR renumbered");
 
-// A queue slot must fit the socket's data buffer.
+// A transmit slot plus the socket header must fit the receiver's budget.
 //
-// CAVEAT, and it is not what this assert says: RS485B_TX_SLOT_LEN is a PAYLOAD length while
-// RS485_RECV_BUFFER is the TOTAL frame budget a receiver allocates (it becomes RS485Socket::recvLimit
-// -> the RS485 channel's bufferSize_ -> malloc). So a full 64-byte slot reaches the wire as
-// 64 + RS485B_SOCKET_HDR_LEN = 71 bytes, and a peer running the default 64-byte buffer — including
-// this bridge's own receive path — silently drops it: RS485_non_blocking.cpp:199-205 calls reset() on
-// overflow, bumping only its internal errorCount_, which nothing reads. Practical ceiling is
-// therefore 57 bytes of payload, not 64. No v1 traffic comes close (the largest frame the bridge
-// emits is a 35-byte PROGRAM), but a WiFi client CAN submit a 64-byte payload, watch rs485Tx
-// increment, and see it vanish. Tracked as its own task rather than fixed here, because the remedy is
-// a behaviour choice — shrink the slot to 57 or raise RS485_RECV_BUFFER (which costs AVR SRAM on
-// every module) — and this file's change is a pure layout fix.
-static_assert(RS485B_TX_SLOT_LEN <= RS485_RECV_BUFFER,
-              "TX slot larger than the RS485 socket data buffer");
+// This assert used to read `RS485B_TX_SLOT_LEN <= RS485_RECV_BUFFER` and pass at 64 <= 64 while the
+// thing it was meant to guarantee was false: the slot is a PAYLOAD length, the buffer covers the whole
+// FRAME, and a 64-byte payload went on the wire as 71 bytes and overflowed every peer on the default
+// buffer. The slot is now derived from the buffer minus the header, so this is true by construction --
+// which means it can no longer fail, and is kept only to stop anyone hardcoding the slot again. The
+// ceiling itself is pinned where it can actually fail: the 57-vs-58 boundary group in ArduinoLibs'
+// test/rs485_receive_test.cpp, and the ingress boundary pair in tests/rs485_bridge_test.cpp.
+static_assert(RS485B_TX_SLOT_LEN + RS485B_SOCKET_HDR_LEN <= RS485B_RECV_BUFFER_LEN,
+              "TX slot + socket header larger than the RS485 receive budget");
+
+// The mirrored buffer size must match the real one. THIS is the assert that can fail -- and it is the
+// only thing tying the two repos' constants together, which is weaker than it sounds: it compiles only
+// under [env:ampworks], and no CI workflow builds that env.
+//
+// So the mirror currently has NO automated guard. Raise RS485_RECV_BUFFER in ArduinoLibs (its own
+// `// XXX: This is a lot of buffer space` comment invites exactly that) and the slot stays at 57, CI
+// stays green, and the bridge quietly under-uses the bus; lower it and the 71-vs-64 silent drop this
+// change removes comes straight back. Extending tools/rs485_bridge_probe.py --self-test to scrape both
+// constants is what will finally make it CI-visible -- that lands with the parent pointer bump. Until
+// then this is a manual invariant, and worth re-checking by hand whenever RS485_RECV_BUFFER moves.
+static_assert(RS485B_RECV_BUFFER_LEN == RS485_RECV_BUFFER,
+              "RS485B_RECV_BUFFER_LEN out of sync with RS485Utils' RS485_RECV_BUFFER");
+
 
 // The protocol header hardcodes the socket header size for its bounds checks.
 static_assert(RS485B_SOCKET_HDR_LEN == sizeof(rs485_socket_hdr_t),
@@ -242,7 +252,7 @@ void UsermodRS485Bridge::serviceRs485() {
 // The one-per-iteration cap is the rate limit that makes the bridge safe to run alongside the LED
 // engine. sendMsgTo() holds the driver-enable pin high and busy-waits on serial->flush() until
 // the frame has physically left the UART — it cannot release DE earlier without truncating the
-// frame on a half-duplex bus — which is ~48 ms for a 64-byte payload at 28000 baud once Gammon's
+// frame on a half-duplex bus — which is ~47 ms for a max-size 64-byte frame at 28000 baud once Gammon's
 // byte-stuffing is counted. Transmitting the whole queue here would multiply that by four and
 // stall the strip refresh (and, with a sustained UDP flood, trip the task watchdog). Everything
 // else waits in RS485BTxQueue, which drops oldest-first if the sender outruns the wire.
@@ -273,9 +283,11 @@ void UsermodRS485Bridge::serviceUdp() {
   for (uint8_t i = 0; i < UDP_PER_LOOP; i++) {
     int packetSize = udp.parsePacket();
     if (packetSize <= 0) return;       // nothing pending
-    // Reading into a fixed UDP_BUF_LEN buffer truncates anything larger, which is intentional:
-    // nothing bigger than a transmit slot can be forwarded anyway, and the truncated frame then
-    // fails validation below instead of being copied somewhere it does not fit.
+    // UDP_BUF_LEN is one socket header LARGER than a transmit slot, deliberately: a payload of
+    // 58..64 is therefore read WHOLE and refused below as RS485B_ERR_OVERSIZE, which is countable,
+    // rather than being truncated here and miscounted as a short frame. Anything beyond 64 (a legal
+    // HMTL frame runs to HMTL_MAX_MSG_LEN == 128) is still truncated and fails validation, which is
+    // fine -- it could not be forwarded either way.
     uint8_t buf[UDP_BUF_LEN];
     int len = udp.read(buf, sizeof(buf));
     // Remember who spoke last so RS485 responses can be relayed back to them. Recorded before
@@ -464,6 +476,10 @@ void UsermodRS485Bridge::sendPollResponse(uint16_t to) {
   resp.config.device_id        = effectiveDeviceId();
   resp.config.address          = address;
   resp.object_type             = HMTL_OBJECT_TYPE_WLED;
+  // The WHOLE-frame budget, per the HMTL wire format -- not the sendable payload, which is 7 bytes
+  // less once the socket header is counted. A master that reads 64 here and sends a 64-byte payload
+  // gets RS485B_ERR_OVERSIZE from the node that advertised it. That is the format's conflation, not
+  // ours, so the value stays as-is; the readme's message table carries the same caveat.
   resp.recv_buffer_size        = RS485_RECV_BUFFER;
   resp.msg_version             = HMTL_MSG_VERSION;
   memcpy(frame + sizeof(msg_hdr_t), &resp, sizeof(resp));
@@ -536,13 +552,22 @@ void UsermodRS485Bridge::addToJsonInfo(JsonObject &root) {
     // than a corrupt one. Without surfacing this the timeout would be invisible in the field, and the
     // bring-up runbook's soak step is written to watch it.
     const uint16_t timeouts = rs485.getTimeoutCount();
-    if (errs || counters.unsupported || counters.txDropped || counters.udpRejected || timeouts) {
+    // Framing errors come from the protocol library and mean something the bridge's own counters
+    // cannot express: a byte that failed the form check, a bad CRC, or a frame that overflowed the
+    // receive buffer. On a healthy bus this stays flat; a steady climb points at line noise or missing
+    // termination rather than at anything in software.
+    const uint16_t framing = rs485.getFramingErrorCount();
+    if (errs || counters.unsupported || counters.txDropped || counters.udpRejected || timeouts ||
+        framing) {
       JsonArray bad = user.createNestedArray(F("RS485 dropped"));
       bad.add(errs);
-      char buf3[80];
-      snprintf_P(buf3, sizeof(buf3), PSTR(" bad, %u unsupported, %u tx-drop, %u udp-rej, %u timeout"),
+      // 128, not 80: five counters plus the literal already ran close enough to 80 that a wide value
+      // would have been truncated, and snprintf_P truncates silently rather than erroring.
+      char buf3[128];
+      snprintf_P(buf3, sizeof(buf3),
+                 PSTR(" bad, %u unsupported, %u tx-drop, %u udp-rej, %u timeout, %u framing"),
                  (unsigned)counters.unsupported, (unsigned)counters.txDropped,
-                 (unsigned)counters.udpRejected, (unsigned)timeouts);
+                 (unsigned)counters.udpRejected, (unsigned)timeouts, (unsigned)framing);
       bad.add(buf3);
     }
   }

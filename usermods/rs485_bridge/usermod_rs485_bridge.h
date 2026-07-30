@@ -90,10 +90,19 @@ class UsermodRS485Bridge : public Usermod {
  private:
   // Work budgets per loop() iteration. Reception is cheap (non-blocking reads of tens of bytes);
   // transmission is not, which is why serviceTx() has a budget of exactly one and needs no
-  // constant here. UDP_BUF_LEN matches a transmit slot because nothing larger can be forwarded.
+  // constant here. UDP_BUF_LEN is deliberately one socket header LARGER than a transmit slot: sized to
+  // the slot, a payload of 58..64 would be truncated by udp.read() and miscounted as a short frame
+  // instead of being read whole and refused as oversize, which is the countable rejection we want.
   static const uint8_t  RX_PER_LOOP  = 4;
   static const uint8_t  UDP_PER_LOOP = 4;
-  static const uint16_t UDP_BUF_LEN  = RS485B_TX_SLOT_LEN;
+  static const uint16_t UDP_BUF_LEN  = RS485B_RECV_BUFFER_LEN;
+  // Asserted in-class because UDP_BUF_LEN is private. The buffer must hold an oversize frame WHOLE or
+  // the countable rejection is unreachable: read into a slot-sized buffer, a 58..64-byte payload is
+  // truncated by udp.read() and miscounted as RS485B_ERR_SHORT instead of RS485B_ERR_OVERSIZE.
+  // Unlike the arithmetic assert in the .cpp, this one can genuinely fail -- reverting this line to
+  // RS485B_TX_SLOT_LEN looks like a harmless simplification and would otherwise compile clean.
+  static_assert(UDP_BUF_LEN >= RS485B_TX_SLOT_LEN + RS485B_SOCKET_HDR_LEN,
+                "UDP read buffer smaller than a max frame: ERR_OVERSIZE would become unreachable");
 
   // config
   bool     enabled    = false;
