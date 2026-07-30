@@ -3,6 +3,7 @@
 #include "wled.h"
 #include "sensor_sync_protocol.h"   // wire format + pure ss_parse_header/ss_dispatch
 #include "sensor_sync_ring.h"       // dependency-free SPSC RX ring (host-tested)
+#include "sensor_control.h"         // pure control-frame parse + ordering/echo logic
 
 #ifndef SENSOR_SYNC_PORT
   #define SENSOR_SYNC_PORT 21330   // no external meaning; avoids WLED's 21324 notifier / 65506 node list
@@ -101,6 +102,14 @@ class UsermodSensorSync : public Usermod {
   bool publishSnapshot(uint8_t sensorType, uint16_t mask);        // TOUCH / SWITCH
   bool publishSample(uint8_t sensorType, uint8_t channel, int16_t value); // PROXIMITY / TEMP
 
+  // --- Control plane (M4) ---
+  // Put a UI/preset command onto the mesh. This is the gateway path: a node that took a command
+  // locally (its own web UI / JSON API) fans it out to the installation. Applies locally too, so
+  // the originator and everyone else converge on the same state.
+  bool publishControl(const SensorControl &c);
+  // Convenience for the common case, so callers don't hand-assemble the field mask.
+  bool publishPreset(uint8_t presetId);
+
   // --- Consumer API (per-consumer cursor over the shared event ring) ---
   SensorCursor subscribe() const { return ring.subscribe(); }
   uint8_t drain(SensorCursor &cur, RemoteSensorEvent *out, uint8_t maxOut) {
@@ -160,9 +169,20 @@ class UsermodSensorSync : public Usermod {
   uint32_t   peerLastSeen[MAX_PEERS] = {};
   uint32_t   lastPeerSweepMs = 0;
 
+  // Last control command applied, for the total order + echo suppression (sensor_control.h).
+  ControlState control = ss_ctrl_init();
+
   static uint32_t deriveDeviceId();
-  bool sendMessage(uint8_t sensorType, const uint8_t *data, uint8_t dataLen);
+  // msgType is explicit so control frames draw from the SAME txSeq counter as snapshots:
+  // the router deduplicates per origin on a single seq space, so a separate counter would
+  // make each type look like a duplicate of the other and get dropped mid-backbone.
+  bool sendMessage(uint8_t msgType, uint8_t sensorType, const uint8_t *data, uint8_t dataLen);
   void receiveLoop();
+  // Split deliberately: applyControl() owns the DECISION for a remote frame (ordering + echo
+  // suppression, which touches `control`), applyControlFields() owns the EFFECT on WLED state and
+  // touches no ordering state. The gateway path needs the effect without the decision.
+  void applyControl(const SensorSyncHeader &h, const SensorControl &c);
+  void applyControlFields(const SensorControl &c);
   void broadcastLocalState();
   void sweepPeers();
 };

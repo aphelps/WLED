@@ -38,11 +38,17 @@ SensorSyncHeader (20B): magic "AMPS" | version | msgType | sensorType | dataLen
                         | deviceId(u32) | seq(u16) | ttl(u8) | flags(u8) | timestamp(u32)
 ```
 
-`msgType` is `SENSOR_SYNC_MSG_SNAPSHOT` (0) for sensor data. Every higher number is a single-hop
-router control frame — `SENSOR_SYNC_MSG_BEACON` (1) leader election, `SENSOR_SYNC_MSG_ROUTER_ADV`
-(2) a router's routing metric, `SENSOR_SYNC_MSG_ATTACH` (3) / `SENSOR_SYNC_MSG_ATTACH_ACK` (4) the
-attach handshake — and only a snapshot is ever relayed. Edges reject all of them via
-`ss_parse_header`'s msgType check. The
+`msgType` is `SENSOR_SYNC_MSG_SNAPSHOT` (0) for sensor data and `SENSOR_SYNC_MSG_CONTROL` (5) for a
+UI/preset command; **those two travel multi-hop**. Numbers 1-4 are the router's own single-hop
+plane — `SENSOR_SYNC_MSG_BEACON` (1) leader election, `SENSOR_SYNC_MSG_ROUTER_ADV` (2) a router's
+routing metric, `SENSOR_SYNC_MSG_ATTACH` (3) / `SENSOR_SYNC_MSG_ATTACH_ACK` (4) the attach
+handshake — and are consumed by whoever hears them. `SENSOR_SYNC_MSG_TIMEBASE` (6) is reserved and
+not yet implemented.
+
+What relays is decided by one whitelist, `ss_router_is_relayable()` in the router repo, mirrored on
+the edge by the parse functions: `ss_parse_header` accepts snapshots only and `ss_parse_control`
+accepts control frames only, so an edge never receives a frame it has no handler for. Adding a
+msgType does **not** make it travel — it has to be listed in that predicate deliberately. The
 `ttl`/`flags` bytes occupy the former `reserved` u16 — still v5, still 20 bytes; legacy senders
 zeroed `reserved`, so old frames arrive `ttl=0` (a relay injects the default). See **Multi-hop
 backbone** below.
@@ -167,6 +173,60 @@ verification is tracked as `## Testing Required` on the task.
   `publish*` call from the producer. No header/version change if the layout is unchanged.
 - **New consumer:** look up the usermod, `subscribe()` once (store the cursor in your effect's
   state), `drain()` each frame. Filter by `sensorType`/`channel`.
+
+## Control plane (M4)
+
+The bus carries UI/preset commands as well as sensor data, so a phone connected to whichever node is
+in range drives the whole installation. That node acts as gateway: it applies the command locally
+and puts it on the mesh, where it fans out to every device and crosses router hops like a snapshot.
+
+**Frame.** `SENSOR_SYNC_MSG_CONTROL` (5) carrying a 16-byte `SensorControl`:
+
+```
+fields (u8)  SS_CTRL_* bitmask — which of the following are meaningful
+presetId (u8) | effectId (u8) | paletteId (u8) | brightness (u8) | rsv (u8) | rsv (u16)
+colour   (u32) 0x00WWRRGGBB
+timebase (u32) origin's Segment::timebase — RESERVED, not consumed yet
+```
+
+Header + payload is 36 bytes against an 84-byte budget, so no fragmentation and no per-node RAM
+change. The `fields` mask means "blink, on this palette, at this brightness" is **one** frame that
+applies atomically, rather than three that can interleave with a competing gateway's.
+
+A preset is applied alone and short-circuits the other fields — it carries a whole look, so applying
+individual fields on top of it would partly override what it just set.
+
+**Ordering.** Two phones on two gateways can issue conflicting commands. The rule is last-writer-wins
+on `(timestamp, deviceId)`, where `timestamp` is the leader-owned shared timebase already in the
+header. `deviceId` breaks ties, which matters because two commands in the same millisecond is not
+exotic at millisecond resolution. The order is total and stateless, so every node picks the same
+winner without agreeing on anything beyond the frames themselves — and only the current winner is
+remembered, not a per-origin table. Comparison is wraparound-safe (`ss_ts_newer`), so a timestamp
+rolling through zero does not freeze the installation until it catches up.
+
+**Echo suppression.** A node never applies its own command coming back to it, and never re-broadcasts
+what it applied. The router's per-origin dedup stops a frame circulating the backbone, but nothing
+stops an *edge* re-originating what it applied under its own `deviceId`, which would defeat that
+dedup entirely — so the edge declines both.
+
+**Roaming.** Moving a phone to another node keeps working, and nothing reverts: control state is
+broadcast **only** on an explicit local command. No node announces its own idea of the state on
+connect, so a newly-arrived gateway cannot undo something newer. This holds by construction rather
+than by a check — see the invariant comment on `publishControl()`. Notably, control frames must
+**not** get the periodic keyframe re-broadcast snapshots use for reliability: a re-sent old command
+is indistinguishable from a new one to a node that rebooted and lost its ordering state.
+
+**Effect phase sync** is deliberately *not* implemented here, only prepared for. Every effect derives
+timing from `strip.now`, which WLED computes as `millis() + Segment::timebase`, and WLED's own UDP
+sync has propagated that value since its protocol v6 — so aligning effect phase across the mesh is a
+matter of agreeing on one `u32`, not of touching effects. `SensorControl.timebase` and
+`SENSOR_SYNC_MSG_TIMEBASE` are on the wire from the first release so that work never needs a format
+break. What is left is assigning `strip.timebase` on receipt and deciding relay-delay compensation.
+
+**Where the code lives.** The wire format and msgType numbers are shared in
+`sensor_sync_protocol.h`; the decisions — validation, the ordering rule, echo suppression — are pure
+functions in `sensor_control.h`, host-tested by `tests/sensor_control_test.cpp`. Only the WLED side
+resolves conflicts; a router relays control frames without inspecting the payload.
 
 ## Multi-hop backbone
 

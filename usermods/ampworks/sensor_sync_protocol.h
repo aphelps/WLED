@@ -25,14 +25,17 @@
 
 #define SENSOR_SYNC_VERSION      5   // wire protocol version (32-bit deviceId; additive types)
 
-// msgType numbers. SNAPSHOT is the only type that travels multi-hop; every number above it is a
-// single-hop control frame that the receiving node consumes rather than re-broadcasts, so a new
-// control type can be added without touching the relay rule.
-#define SENSOR_SYNC_MSG_SNAPSHOT   0   // a full sensor-state snapshot (the multi-hop payload)
+// msgType numbers. SNAPSHOT and CONTROL travel multi-hop; types 1-4 are the router's own
+// single-hop control plane, which the receiving router consumes rather than re-broadcasts.
+// Which types relay is decided by one predicate on the router side (ss_router_is_relayable) and
+// mirrored by the edge's accept checks — adding a type is not enough to make it travel.
+#define SENSOR_SYNC_MSG_SNAPSHOT   0   // a full sensor-state snapshot (multi-hop)
 #define SENSOR_SYNC_MSG_BEACON     1   // router leader-election beacon (router to router)
 #define SENSOR_SYNC_MSG_ROUTER_ADV 2   // router heartbeat advertising its routing metric
 #define SENSOR_SYNC_MSG_ATTACH     3   // node announcing itself to a router (attach + keepalive)
 #define SENSOR_SYNC_MSG_ATTACH_ACK 4   // router accepting an attach, granting a membership lease
+#define SENSOR_SYNC_MSG_CONTROL    5   // a UI/preset command from a gateway node (multi-hop)
+#define SENSOR_SYNC_MSG_TIMEBASE   6   // reserved: periodic timebase beacon (see SensorControl.timebase)
 
 // Multi-hop relay. TTL bounds flood diameter; per-origin seq dedup terminates loops. The
 // origin stamps SS_DEFAULT_TTL; each relay re-broadcasts with ttl-1 and drops once ttl would reach 0.
@@ -68,6 +71,37 @@ struct __attribute__((packed)) SensorSnapshot {
 };
 
 // Scalar per-channel sample — SS_SENSOR_PROXIMITY (0..255) and SS_SENSOR_TEMP (centi-deg C).
+// Control-plane field selector. One frame carries however many of the fields below are meaningful,
+// so "blink, on this palette, at this brightness" arrives as ONE frame and applies atomically —
+// rather than as three frames that can interleave with a competing gateway's.
+#define SS_CTRL_PRESET      0x01
+#define SS_CTRL_EFFECT      0x02
+#define SS_CTRL_PALETTE     0x04
+#define SS_CTRL_BRIGHTNESS  0x08
+#define SS_CTRL_COLOUR      0x10
+#define SS_CTRL_TIMEBASE    0x20  // `timebase` is meaningful (see below; not consumed yet)
+
+// A control command. 16 bytes, so header+payload is 36 of the 84-byte budget — no fragmentation,
+// no per-node RAM change. Deliberately a fixed struct rather than JSON: see SENSOR_SYNC.md.
+//
+// `timebase` is on the wire from the first release but NOT consumed yet. Effects derive all their
+// timing from `strip.now`, which WLED computes as `millis() + Segment::timebase` ("common time base
+// for all effects", FX_fcn.cpp), and WLED's own UDP sync has propagated exactly this value since its
+// protocol v6. So phase-aligning effects across the mesh is a matter of agreeing on this one u32,
+// not of touching effects — but deciding relay-delay compensation is its own task. Carrying the
+// field now means that task never has to break the wire format.
+struct __attribute__((packed)) SensorControl {
+  uint8_t  fields;      // SS_CTRL_* bitmask: which of the following are meaningful
+  uint8_t  presetId;    // preset to apply (1..250)
+  uint8_t  effectId;    // FX mode index
+  uint8_t  paletteId;   // palette index
+  uint8_t  brightness;  // 0..255
+  uint8_t  _rsv0;       // reserved; must be 0
+  uint16_t _rsv1;       // reserved; must be 0 — pads the u32s below to 4-byte alignment
+  uint32_t colour;      // 0x00WWRRGGBB
+  uint32_t timebase;    // origin's Segment::timebase, for effect phase alignment
+};
+
 struct __attribute__((packed)) SensorSample {
   uint8_t  channel;    // which sensor of this type on the origin device
   int16_t  value;      // proximity level, or temperature in centi-degrees

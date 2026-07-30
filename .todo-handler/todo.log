@@ -1,0 +1,1 @@
+2026-07-16 05:36:37 UTC  [SUBTASK_DONE]     mesh-m1-generalize-touch-sync-to-a-typed-multi-sensor-event-bus  Pure protocol header + host tests (11 pass); typed TOUCH/SWITCH/PROX/TEMP; wraparound-safe seq dedup. Firmware still builds (header inert until wired).

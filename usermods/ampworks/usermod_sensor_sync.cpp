@@ -114,14 +114,15 @@ uint32_t UsermodSensorSync::deriveDeviceId() {
 }
 
 // --- producer ---
-bool UsermodSensorSync::sendMessage(uint8_t sensorType, const uint8_t *data, uint8_t dataLen) {
+bool UsermodSensorSync::sendMessage(uint8_t msgType, uint8_t sensorType, const uint8_t *data,
+                                    uint8_t dataLen) {
   if (!started) return false;
   uint8_t buf[RX_BUF_LEN];
   if ((int)sizeof(SensorSyncHeader) + dataLen > (int)sizeof(buf)) return false;
   SensorSyncHeader h;
   h.magic[0] = 'A'; h.magic[1] = 'M'; h.magic[2] = 'P'; h.magic[3] = 'S';
   h.version    = SENSOR_SYNC_VERSION;
-  h.msgType    = SENSOR_SYNC_MSG_SNAPSHOT;
+  h.msgType    = msgType;
   h.sensorType = sensorType;
   h.dataLen    = dataLen;
   h.deviceId   = deviceId;
@@ -138,12 +139,95 @@ bool UsermodSensorSync::sendMessage(uint8_t sensorType, const uint8_t *data, uin
 
 bool UsermodSensorSync::publishSnapshot(uint8_t sensorType, uint16_t mask) {
   SensorSnapshot snap; snap.mask = mask;
-  return sendMessage(sensorType, reinterpret_cast<const uint8_t *>(&snap), sizeof(snap));
+  return sendMessage(SENSOR_SYNC_MSG_SNAPSHOT, sensorType,
+                     reinterpret_cast<const uint8_t *>(&snap), sizeof(snap));
 }
 
 bool UsermodSensorSync::publishSample(uint8_t sensorType, uint8_t channel, int16_t value) {
   SensorSample s; s.channel = channel; s.value = value;
-  return sendMessage(sensorType, reinterpret_cast<const uint8_t *>(&s), sizeof(s));
+  return sendMessage(SENSOR_SYNC_MSG_SNAPSHOT, sensorType,
+                     reinterpret_cast<const uint8_t *>(&s), sizeof(s));
+}
+
+// --- control plane: gateway path ---
+// Apply locally first, then broadcast. Local-first means the phone sees its own node respond at
+// once instead of waiting for a round trip, and it costs nothing in convergence: our own frame is
+// stamped with this node's deviceId, so ss_ctrl_should_apply rejects it if it loops back to us.
+//
+// The local apply deliberately does NOT go through applyControl() — that function's job is to
+// decide about a REMOTE command, and running our own through it would record us as the winner in
+// `control`, which would then reject a genuinely newer remote command arriving in the same
+// millisecond from a higher deviceId. The originator stays out of its own ordering state.
+//
+// INVARIANT — nothing may broadcast control state except an explicit local command.
+// This is what makes roaming safe: when a phone moves to another node, that node must not announce
+// its own idea of the state and undo something newer. It holds by construction today (this is the
+// only producer, and `connected()` merely rebinds), NOT by a check, so it is easy to break by
+// accident. In particular, do not give control frames the periodic keyframe re-broadcast that
+// snapshots get for reliability: a re-sent old command would be indistinguishable from a new one to
+// a node that had rebooted and lost its ordering state, and would resurrect state the user had
+// already moved on from.
+bool UsermodSensorSync::publishControl(const SensorControl &c) {
+  if (!started) return false;
+  // Timestamps come from the shared timebase, which is what makes the ordering rule meaningful
+  // across nodes rather than just within one.
+  applyControlFields(c);
+  return sendMessage(SENSOR_SYNC_MSG_CONTROL, 0,
+                     reinterpret_cast<const uint8_t *>(&c), sizeof(c));
+}
+
+bool UsermodSensorSync::publishPreset(uint8_t presetId) {
+  SensorControl c{};
+  c.fields   = SS_CTRL_PRESET;
+  c.presetId = presetId;
+  c.timebase = strip.timebase;   // reserved for phase-lock; carried from the first release
+  return publishControl(c);
+}
+
+// --- control plane: apply path ---
+// Mutate WLED state from a command. No ordering state is touched here, so this is equally usable
+// for a remote command (via applyControl) and for our own (via publishControl).
+//
+// CALL_MODE_NO_NOTIFY throughout: this state change is already being distributed by the mesh, and
+// letting WLED's own notifier re-announce it would put the same change onto the network twice by a
+// second path, with its own echo characteristics we do not control.
+void UsermodSensorSync::applyControlFields(const SensorControl &c) {
+  // A preset carries a whole look, so it is applied first and alone — the individual fields below
+  // would otherwise be applied on top of it and partially override what the preset just set.
+  if (c.fields & SS_CTRL_PRESET) {
+    if (c.presetId >= 1 && c.presetId <= 250) applyPreset(c.presetId, CALL_MODE_NO_NOTIFY);
+    return;
+  }
+
+  bool changed = false;
+  if (c.fields & SS_CTRL_EFFECT) {
+    if (c.effectId < strip.getModeCount()) { strip.getMainSegment().setMode(c.effectId); changed = true; }
+  }
+  if (c.fields & SS_CTRL_PALETTE) {
+    if (c.paletteId < getPaletteCount()) { strip.getMainSegment().setPalette(c.paletteId); changed = true; }
+  }
+  if (c.fields & SS_CTRL_COLOUR) {
+    strip.getMainSegment().setColor(0, c.colour);
+    changed = true;
+  }
+  if (c.fields & SS_CTRL_BRIGHTNESS) {
+    bri = c.brightness;
+    changed = true;
+  }
+  if (changed) stateUpdated(CALL_MODE_NO_NOTIFY);
+
+  // c.timebase is intentionally not consumed yet — see SensorControl in sensor_sync_protocol.h.
+}
+
+// Decide whether a REMOTE command should be applied, then apply it. The decision is pure and lives
+// in sensor_control.h, so the conflict rule and echo suppression are host-tested rather than only
+// exercised on hardware.
+void UsermodSensorSync::applyControl(const SensorSyncHeader &h, const SensorControl &c) {
+  if (!ss_ctrl_should_apply(control, h.timestamp, h.deviceId, deviceId)) return;
+  applyControlFields(c);
+  // Deliberately NOT re-broadcast. The router's per-origin dedup stops a frame circulating the
+  // backbone, but nothing stops an edge from re-originating what it just applied under its OWN
+  // deviceId — which would defeat that dedup entirely and flood the mesh.
 }
 
 // --- receive ---
@@ -151,6 +235,14 @@ void UsermodSensorSync::receiveLoop() {
   uint8_t buf[RX_BUF_LEN];
   int rd;
   while ((rd = transport->poll(buf, sizeof(buf))) > 0) {
+    // Control frames are a separate wire path with their own validation; ss_parse_header is left
+    // gating strictly on snapshots so the sensor path cannot be handed a frame it has no
+    // handler for.
+    {
+      SensorSyncHeader ch;
+      SensorControl    cc;
+      if (ss_parse_control(buf, rd, deviceId, ch, cc)) { applyControl(ch, cc); continue; }
+    }
     SensorSyncHeader h;
     if (!ss_parse_header(buf, rd, deviceId, h)) continue;
     RemoteSensorEvent evbuf[16];
