@@ -232,6 +232,7 @@ static_assert(WLED_MAX_BUSSES <= 32, "WLED_MAX_BUSSES exceeds hard limit");
 #define USERMOD_ID_USER_FX               58     //Usermod "user_fx"
 #define USERMOD_ID_MPR121                60     //Usermod "usermods/mpr121/usermod_mpr121.h" (AMPWorks)
 #define USERMOD_ID_SENSOR_SYNC           61     //Usermod "usermods/ampworks/usermod_sensor_sync.h" (AMPWorks)
+#define USERMOD_ID_RS485_BRIDGE          62     //Usermod "usermods/rs485_bridge/usermod_rs485_bridge.h" (AMPWorks)
 
 //Wifi encryption type
 #ifdef WLED_ENABLE_WPA_ENTERPRISE
