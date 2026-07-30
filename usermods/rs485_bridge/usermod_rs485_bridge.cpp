@@ -11,7 +11,19 @@ static_assert(RS485B_WLED_MODE_FADE    == FX_MODE_FADE,        "FX_MODE_FADE ren
 static_assert(RS485B_WLED_MODE_SPARKLE == FX_MODE_SPARKLE,     "FX_MODE_SPARKLE renumbered");
 static_assert(RS485B_WLED_MODE_CHASE   == FX_MODE_CHASE_COLOR, "FX_MODE_CHASE_COLOR renumbered");
 
-// A queue slot must be able to hold the largest frame the socket can carry.
+// A queue slot must fit the socket's data buffer.
+//
+// CAVEAT, and it is not what this assert says: RS485B_TX_SLOT_LEN is a PAYLOAD length while
+// RS485_RECV_BUFFER is the TOTAL frame budget a receiver allocates (it becomes RS485Socket::recvLimit
+// -> the RS485 channel's bufferSize_ -> malloc). So a full 64-byte slot reaches the wire as
+// 64 + RS485B_SOCKET_HDR_LEN = 71 bytes, and a peer running the default 64-byte buffer — including
+// this bridge's own receive path — silently drops it: RS485_non_blocking.cpp:199-205 calls reset() on
+// overflow, bumping only its internal errorCount_, which nothing reads. Practical ceiling is
+// therefore 57 bytes of payload, not 64. No v1 traffic comes close (the largest frame the bridge
+// emits is a 35-byte PROGRAM), but a WiFi client CAN submit a 64-byte payload, watch rs485Tx
+// increment, and see it vanish. Tracked as its own task rather than fixed here, because the remedy is
+// a behaviour choice — shrink the slot to 57 or raise RS485_RECV_BUFFER (which costs AVR SRAM on
+// every module) — and this file's change is a pure layout fix.
 static_assert(RS485B_TX_SLOT_LEN <= RS485_RECV_BUFFER,
               "TX slot larger than the RS485 socket data buffer");
 

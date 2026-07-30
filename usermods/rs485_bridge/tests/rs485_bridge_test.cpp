@@ -128,6 +128,40 @@ int main() {
 
   // 1) Wire layout is what legacy HMTL modules expect.
   {
+    // The RS485 socket header wraps every HMTL frame on the wire, and its size is what places the
+    // payload at both ends. It is 7 bytes because RS485Utils packs the struct; unpacked it would be 7
+    // on AVR and 8 on this host, and a bridge built with 8 misparses every frame a real ATMega328
+    // module sends (and vice versa).
+    //
+    // This file cannot include RS485Utils.h (it pulls in Arduino.h), so the check is against a
+    // replica of the declaration rather than the struct itself. Be precise about what that does and
+    // does not prove:
+    //   * it DOES prove that this field list, packed, is 7 bytes with these offsets under BOTH the
+    //     native and the -fpack-struct=1 (AVR-like) ABI — which is the cross-ABI claim the wire
+    //     format depends on, and it fails if anyone edits the replica or the constant out of step
+    //   * it does NOT observe the real rs485_socket_hdr_t. If a field is added to the real struct,
+    //     this replica goes stale and stays green. The only check tying the constant to the real
+    //     declaration is the static_assert at usermod_rs485_bridge.cpp:19, and that compiles ONLY in
+    //     [env:ampworks] — an env no CI workflow builds — so it is a local guard, not an automated
+    //     one. Keep them in step by hand.
+    // (An earlier version of this asserted `RS485B_SOCKET_HDR_LEN == 7` on its own. That is 7 == 7:
+    // identical under both ABIs and green even with the packing attribute deleted. Caught in review.)
+    struct __attribute__((__packed__)) socketHdrReplica {
+      uint8_t  ID;
+      uint8_t  length;
+      uint16_t source;    // socket_addr_t
+      uint16_t address;   // socket_addr_t
+      uint8_t  flags;
+    };
+    CHECK(sizeof(socketHdrReplica) == RS485B_SOCKET_HDR_LEN,
+          "RS485 socket header is RS485B_SOCKET_HDR_LEN bytes under this ABI");
+    CHECK(RS485B_SOCKET_HDR_LEN == 7, "RS485 socket header is 7B (the AVR layout) on every target");
+    CHECK(offsetof(socketHdrReplica, ID)      == 0, "socket hdr ID at 0");
+    CHECK(offsetof(socketHdrReplica, length)  == 1, "socket hdr length at 1");
+    CHECK(offsetof(socketHdrReplica, source)  == 2, "socket hdr source at 2");
+    CHECK(offsetof(socketHdrReplica, address) == 4, "socket hdr address at 4");
+    CHECK(offsetof(socketHdrReplica, flags)   == 6, "socket hdr flags at 6");
+
     CHECK(sizeof(msg_hdr_t) == 8, "msg_hdr_t is 8B");
     CHECK(sizeof(msg_rgb_t) == 5, "msg_rgb_t is 5B");
     CHECK(sizeof(msg_value_t) == 4, "msg_value_t is 4B");

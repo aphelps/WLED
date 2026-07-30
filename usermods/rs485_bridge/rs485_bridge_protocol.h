@@ -31,13 +31,25 @@
 // ---------------------------------------------------------------------------------------------
 // RS485 socket layer (mirrors ArduinoLibs RS485Utils' rs485_socket_hdr_t) — size math only.
 // ---------------------------------------------------------------------------------------------
-// { byte ID; byte length; uint16_t source; uint16_t address; byte flags; } with natural
-// alignment == 8 bytes. Used to bounds-check RS485Socket::getLength() against the payload
-// length before dereferencing (RS485Utils' own checks are compiled out in release builds:
-// they sit inside `#if DEBUG_LEVEL >= DEBUG_TRACE`). Declared as a literal rather than taken from
-// RS485Utils.h because that header pulls in Arduino.h; usermod_rs485_bridge.cpp static_asserts it
-// against the real struct.
-#define RS485B_SOCKET_HDR_LEN 8
+// { byte ID; byte length; uint16_t source; uint16_t address; byte flags; } == 7 bytes, on every
+// target: the struct is __attribute__((__packed__)) in RS485Utils.h. It has to be. Unpacked it is 7
+// bytes on AVR (alignment 1) but 8 on a 2-byte-aligned ABI, and that size is what positions the
+// payload at both ends — so this bridge emitted [7 header][1 pad][payload] while a legacy ATMega328
+// module read the payload from offset 7, misparsing every frame in both directions. This constant
+// read 8 for exactly as long as that bug existed.
+//
+// Used to bounds-check RS485Socket::getLength() against the payload length before dereferencing
+// (RS485Utils' own checks are compiled out in release builds: they sit inside
+// `#if DEBUG_LEVEL >= DEBUG_TRACE`). Declared as a literal rather than taken from RS485Utils.h
+// because that header pulls in Arduino.h. Two checks keep it honest, and neither is automated:
+//   * usermod_rs485_bridge.cpp:19 static_asserts it against the REAL struct — the only check that
+//     does — but compiles solely in [env:ampworks], which no CI workflow builds.
+//   * tests/rs485_bridge_test.cpp group 1 asserts this value against a packed *replica* of the
+//     declaration under both the native and the -fpack-struct=1 ABI. That proves the field list is
+//     7 bytes on both, and fails if the packing is dropped; it cannot see the real struct, so a
+//     field added there leaves the replica stale and green.
+// Keep all three in step by hand.
+#define RS485B_SOCKET_HDR_LEN 7
 
 // The object type this bridge reports in a POLL response. Not a stock HMTL object type — it is
 // how a master tells a WLED bridge apart from a real HMTL module.
