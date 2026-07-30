@@ -41,9 +41,14 @@
 // Used to bounds-check RS485Socket::getLength() against the payload length before dereferencing
 // (RS485Utils' own checks are compiled out in release builds: they sit inside
 // `#if DEBUG_LEVEL >= DEBUG_TRACE`). Declared as a literal rather than taken from RS485Utils.h
-// because that header pulls in Arduino.h; usermod_rs485_bridge.cpp static_asserts it against the
-// real struct, and tests/rs485_bridge_test.cpp asserts the literal on both ABIs — that host test is
-// the only automated guard, since no CI env builds [env:ampworks].
+// because that header pulls in Arduino.h. Two checks keep it honest, and neither is automated:
+//   * usermod_rs485_bridge.cpp:19 static_asserts it against the REAL struct — the only check that
+//     does — but compiles solely in [env:ampworks], which no CI workflow builds.
+//   * tests/rs485_bridge_test.cpp group 1 asserts this value against a packed *replica* of the
+//     declaration under both the native and the -fpack-struct=1 ABI. That proves the field list is
+//     7 bytes on both, and fails if the packing is dropped; it cannot see the real struct, so a
+//     field added there leaves the replica stale and green.
+// Keep all three in step by hand.
 #define RS485B_SOCKET_HDR_LEN 7
 
 // The object type this bridge reports in a POLL response. Not a stock HMTL object type — it is
