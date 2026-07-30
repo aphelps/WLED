@@ -24,8 +24,15 @@
 #include <string.h>
 
 #define SENSOR_SYNC_VERSION      5   // wire protocol version (32-bit deviceId; additive types)
-#define SENSOR_SYNC_MSG_SNAPSHOT 0   // msgType: a full sensor-state snapshot
-#define SENSOR_SYNC_MSG_BEACON   1   // msgType: router leader-election beacon (routers only)
+
+// msgType numbers. SNAPSHOT is the only type that travels multi-hop; every number above it is a
+// single-hop control frame that the receiving node consumes rather than re-broadcasts, so a new
+// control type can be added without touching the relay rule.
+#define SENSOR_SYNC_MSG_SNAPSHOT   0   // a full sensor-state snapshot (the multi-hop payload)
+#define SENSOR_SYNC_MSG_BEACON     1   // router leader-election beacon (router to router)
+#define SENSOR_SYNC_MSG_ROUTER_ADV 2   // router heartbeat advertising its routing metric
+#define SENSOR_SYNC_MSG_ATTACH     3   // node announcing itself to a router (attach + keepalive)
+#define SENSOR_SYNC_MSG_ATTACH_ACK 4   // router accepting an attach, granting a membership lease
 
 // Multi-hop relay. TTL bounds flood diameter; per-origin seq dedup terminates loops. The
 // origin stamps SS_DEFAULT_TTL; each relay re-broadcasts with ttl-1 and drops once ttl would reach 0.
@@ -64,6 +71,34 @@ struct __attribute__((packed)) SensorSnapshot {
 struct __attribute__((packed)) SensorSample {
   uint8_t  channel;    // which sensor of this type on the origin device
   int16_t  value;      // proximity level, or temperature in centi-degrees
+};
+
+// --- Attach protocol payloads -----------------------------------------------------------------
+// A node binds to one router so the router knows who depends on it and the node knows where its
+// traffic is bridged. All three frames are single-hop (ttl = 1): a router advertises its distance
+// to the timebase leader, a node attaches to the router it ranks best, and the router acks with a
+// membership lease. The selection + membership LOGIC lives in the esp-now-router repo; only these
+// structs and their msgType numbers are shared, because both sides parse them off the wire.
+
+#define SS_HOP_UNREACHABLE 255   // hopCost meaning "this router has no path to the leader"
+
+// Payload of SENSOR_SYNC_MSG_ROUTER_ADV. The advertising router's own id is the header deviceId.
+struct __attribute__((packed)) RouterAdvert {
+  uint32_t leaderId;    // timebase leader this router routes toward (0 = none known yet)
+  uint16_t leaderTerm;  // leadership term the metric was computed in (stale-advert guard)
+  uint8_t  hopCost;     // hops from this router to the leader; 0 = it is the leader itself
+  uint8_t  memberCount; // nodes currently attached to it (load, the secondary ranking term)
+};
+
+// Payload of SENSOR_SYNC_MSG_ATTACH. Sent by the attaching node; its id is the header deviceId.
+struct __attribute__((packed)) NodeAttach {
+  uint32_t routerId;    // the router being attached to; must name one router, never 0
+};
+
+// Payload of SENSOR_SYNC_MSG_ATTACH_ACK. Broadcast by the router; addressed by nodeId.
+struct __attribute__((packed)) AttachAck {
+  uint32_t nodeId;      // the node this ack answers
+  uint32_t leaseMs;     // membership is held this long without a further attach
 };
 
 // What consumers see after the receiver derives an event from a remote message.
@@ -133,12 +168,13 @@ static inline bool ss_seq_newer(uint16_t a, uint16_t b) {
 }
 
 // --- Routing logic lives in the router repo ---------------------------------------------------
-// The relay + leader-election LOGIC (ss_router_should_relay / ss_router_relay_slot /
-// SensorRouterPeer / ss_router_beacon_better / RouterBeacon) is NOT here — the WLED edge never
-// calls it. It lives in the esp-now-router repo (`src/router_relay.h`), which includes this header
-// for the shared wire types. Only the on-the-wire *format* stays shared: the SensorSyncHeader
-// ttl/flags fields, SS_DEFAULT_TTL (the edge sender stamps it), and the reserved msgType/flag
-// numbers (SENSOR_SYNC_MSG_BEACON, SS_FLAG_RELAYED) above.
+// The relay, leader-election and attach LOGIC (ss_router_should_relay / ss_router_relay_slot /
+// SensorRouterPeer / ss_router_beacon_better / RouterBeacon, and the membership table + route
+// selection) is NOT here — the WLED edge never calls it. It lives in the esp-now-router repo
+// (`src/router_relay.h`, `src/router_election.h`, `src/router_attach.h`), which includes this
+// header for the shared wire types. Only the on-the-wire *format* stays shared: the
+// SensorSyncHeader ttl/flags fields, SS_DEFAULT_TTL (the edge sender stamps it), the attach
+// payload structs, and the reserved msgType/flag numbers above.
 
 // Find (or allocate) the peer slot for dev. Reuses a free slot; if full, evicts the peer with
 // the oldest lastSeq activity is not tracked here, so evict slot 0 (documented resync-from-0).

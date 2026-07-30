@@ -38,8 +38,11 @@ SensorSyncHeader (20B): magic "AMPS" | version | msgType | sensorType | dataLen
                         | deviceId(u32) | seq(u16) | ttl(u8) | flags(u8) | timestamp(u32)
 ```
 
-`msgType` is `SENSOR_SYNC_MSG_SNAPSHOT` (0) for sensor data; `SENSOR_SYNC_MSG_BEACON` (1) is a
-router-only leader-election beacon (edges reject it via `ss_parse_header`'s msgType check). The
+`msgType` is `SENSOR_SYNC_MSG_SNAPSHOT` (0) for sensor data. Every higher number is a single-hop
+router control frame — `SENSOR_SYNC_MSG_BEACON` (1) leader election, `SENSOR_SYNC_MSG_ROUTER_ADV`
+(2) a router's routing metric, `SENSOR_SYNC_MSG_ATTACH` (3) / `SENSOR_SYNC_MSG_ATTACH_ACK` (4) the
+attach handshake — and only a snapshot is ever relayed. Edges reject all of them via
+`ss_parse_header`'s msgType check. The
 `ttl`/`flags` bytes occupy the former `reserved` u16 — still v5, still 20 bytes; legacy senders
 zeroed `reserved`, so old frames arrive `ttl=0` (a relay injects the default). See **Multi-hop
 backbone** below.
@@ -174,10 +177,12 @@ reaches every edge even across an installation. The router firmware lives in its
 wire format cannot drift.
 
 The router-only helpers (`ss_router_should_relay`, `ss_router_relay_slot`,
-`ss_router_beacon_better`, `SensorRouterPeer`) live in the router repo
-(`esp-now-router/src/router_relay.h`), not in this header — the edge firmware never calls them.
-They are tested from that repo (`esp-now-router/tests/`); this repo's host tests cover the edge
-dispatch it uses. Only the wire format is shared.
+`ss_router_beacon_better`, `SensorRouterPeer`, plus the membership table and route selection) live
+in the router repo (`esp-now-router/src/router_relay.h`, `router_election.h`, `router_attach.h`),
+not in this header — the edge firmware never calls them. They are tested from that repo
+(`esp-now-router/tests/`); this repo's host tests cover the edge dispatch it uses. Only the wire
+format is shared: the header fields, the msgType numbers, and the attach payload structs
+(`RouterAdvert`, `NodeAttach`, `AttachAck`) that both sides parse.
 
 - **Relay** — `ss_router_should_relay(header, selfId, seenTable, n, &outTtl)` (pure, host-tested): a
   loop-free flood. Per-origin `seq` dedup (`ss_seq_newer`) terminates loops; `ttl` (origin stamps
@@ -186,9 +191,21 @@ dispatch it uses. Only the wire format is shared.
 - **Leader election** — routers beacon `{uptimeTicks, term}` (`SENSOR_SYNC_MSG_BEACON`);
   `ss_router_beacon_better` picks the highest `(uptimeTicks, deviceId)` as timebase leader, with
   step-down + reassert. Degenerates cleanly to a single router.
+- **Attach + failover** — a router advertises `RouterAdvert{leaderId, leaderTerm, hopCost,
+  memberCount}`; a node binds to the router with the fewest hops to the leader (then least loaded,
+  then highest `deviceId`) and holds the binding with periodic `NodeAttach` keepalives that the
+  router answers with an `AttachAck` lease. A silent router is dropped on a heartbeat timeout and
+  the next advertisement heard replaces it. Relaying continues throughout, and an edge that missed
+  a transition during the churn is re-synced by the next `keyframeMs` snapshot.
 
-Router design + go/no-go notes and the relay/election host tests live in the `esp-now-router` repo
-(`BACKBONE_ROUTER.md`, `tests/`).
+  **This repo reserves the format only.** `ss_parse_header` accepts `SENSOR_SYNC_MSG_SNAPSHOT`
+  alone, so a WLED edge ignores all three attach msgTypes: the handshake currently runs
+  router-to-router, and edges reach the mesh as plain snapshot senders rather than as attached
+  members. The numbers and structs live here so the edge can implement the client half later
+  without a wire change.
+
+Router design + go/no-go notes and the relay/election/attach host tests live in the
+`esp-now-router` repo (`BACKBONE_ROUTER.md`, `tests/`).
 
 ## Maintenance
 
