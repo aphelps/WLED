@@ -133,7 +133,7 @@ static inline uint8_t rs485b_hmtl_crc(const uint8_t *msg, uint8_t len) {
 //
 // The CRC covers the payload as well as the header, so the payload must be in place *before*
 // calling this. A caller that fills the payload afterwards has to re-stamp buf[1] itself — see
-// sendPollResponse() in usermod_rs485_bridge.cpp, which does exactly that.
+// rs485b_build_poll_response() below, which does exactly that.
 static inline uint8_t rs485b_hmtl_fmt(uint8_t *buf, uint16_t bufSize, uint16_t address,
                                       uint8_t length, uint8_t type, uint8_t flags) {
   // Reject both under- and over-sized requests: `length` goes on the wire as the authoritative
@@ -155,6 +155,20 @@ static inline uint8_t rs485b_hmtl_fmt(uint8_t *buf, uint16_t bufSize, uint16_t a
 // ---------------------------------------------------------------------------------------------
 // Poll response
 // ---------------------------------------------------------------------------------------------
+// May we answer a poll from this SOCKET-layer source?
+//
+// No, if the source is the broadcast address. That happens with an unconfigured module (blank EEPROM),
+// and answering would put an ACK'd poll response on the bus addressed to SOCKET_ADDR_ANY — which
+// MessageHandler.cpp:81-82 exempts from its ACK short-circuit, so every stock module would treat it as
+// a fresh poll and answer, each after delay(address * 2). One malformed source, one bus-wide storm.
+//
+// A predicate rather than an `if` inside the usermod, because the usermod lives behind wled.h and a
+// guard there could not be tested at all — and a guard that cannot fail is the failure mode this
+// subsystem keeps producing.
+static inline bool rs485b_should_answer_poll(uint16_t sourceAddr) {
+  return sourceAddr != SOCKET_ADDR_ANY;
+}
+
 // This node's identity, as a poll response advertises it. Grouped into a struct on purpose: the
 // builder below needs both this node's address and the requester's, and two bare adjacent uint16_t
 // parameters could be transposed at the call site with nothing to catch it — the header address and
@@ -180,6 +194,11 @@ static inline uint8_t rs485b_build_poll_response(uint8_t *buf, uint16_t bufSize,
                                                  const RS485BPollInfo &info) {
   const uint8_t len = (uint8_t)HMTL_MSG_POLL_MIN_LEN;
   if (bufSize < len) return 0;
+  // Zero the payload region first. rs485b_hmtl_fmt() CRCs the WHOLE frame, but the payload is not
+  // written until the memcpy below — so without this it hashes indeterminate stack bytes. The value is
+  // harmless (the re-stamp at the end overwrites it), but reading indeterminate memory is UB and both
+  // MSan and -Wmaybe-uninitialized will say so the moment anyone points a sanitizer at this suite.
+  memset(buf, 0, len);
   // ACK marks this as a response to a poll rather than a poll of our own.
   if (!rs485b_hmtl_fmt(buf, bufSize, requesterAddr, len, MSG_TYPE_POLL, MSG_FLAG_ACK)) return 0;
 
@@ -652,6 +671,13 @@ struct RS485BCounters {
   uint32_t udpRx        = 0;
   uint32_t udpRejected  = 0;
   uint32_t txDropped    = 0;   // queue overflow, drop-oldest
+  // Polls we deliberately declined to answer, plus locally-built frames that failed to format.
+  // Kept OUT of txDropped on purpose: every other txDropped increment is a transmit that failed under
+  // load, and the bring-up runbook reads a rising tx-drop as "the rate limiter is working". Folding a
+  // refusal into it would make an unconfigured module on the bus look like healthy backpressure and
+  // send a human after the wrong subsystem — during bring-up, where these counters are the only
+  // diagnostic there is.
+  uint32_t pollRefused  = 0;
 
   // Bump the bucket matching a validation result. RS485B_OK is accepted and ignored so callers
   // can pass a result through unconditionally; the enum is listed exhaustively (no `default`) so

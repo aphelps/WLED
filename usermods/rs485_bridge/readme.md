@@ -154,7 +154,7 @@ broadcast address `0xFFFF`.
 | `MSG_TYPE_OUTPUT` / `HMTL_OUTPUT_RGB` | `msg_rgb_t` | Main segment colour 0 ← RGB, effect forced to `FX_MODE_STATIC`. |
 | `MSG_TYPE_OUTPUT` / `HMTL_OUTPUT_VALUE` | `msg_value_t` | Master brightness ← value (13-bit field clamped to 255). HMTL drives all three channels from this field, i.e. a white level. |
 | `MSG_TYPE_OUTPUT` / `HMTL_OUTPUT_PROGRAM` or `_PIXELS` | `msg_program_t` | See the program map below. |
-| `MSG_TYPE_POLL` | — | **A request** (no `MSG_FLAG_ACK`) is answered with an HMTL poll response (config v3 header, `object_type` `0x57`, `recv_buffer_size` 64) addressed to the **requester** — a stock `HMTL_Module` discards a response addressed to the sender's own address. **A response** (`MSG_FLAG_ACK` set, which is how a module's own poll reply arrives, since it is sent to the poll's socket-layer source) is relayed to the WiFi peer, never answered — including when broadcast, so one broadcast ACK cannot make every node on the bus reply at once. **`recv_buffer_size` is the whole-frame budget, not the sendable payload** — subtract the 7-byte socket header for that, so 57. A master that takes 64 as a payload size and sends 64 gets `RS485B_ERR_OVERSIZE` from the node that advertised it; that conflation is in the HMTL wire format, not in this bridge. |
+| `MSG_TYPE_POLL` | — | **A request** (no `MSG_FLAG_ACK`) is answered with an HMTL poll response (config v3 header, `object_type` `0x57`, `recv_buffer_size` 64) addressed to the **requester** — unless the poll's socket-layer source is `0xFFFF` (an unconfigured module), in which case it is refused and counted as `poll-refused`, because an ACK'd response addressed to the broadcast address would make every stock module on the bus answer it — a stock `HMTL_Module` discards a response addressed to the sender's own address. **A response** (`MSG_FLAG_ACK` set, which is how a module's own poll reply arrives, since it is sent to the poll's socket-layer source) is relayed to the WiFi peer, never answered — including when broadcast, so one broadcast ACK cannot make every node on the bus reply at once. **`recv_buffer_size` is the whole-frame budget, not the sendable payload** — subtract the 7-byte socket header for that, so 57. A master that takes 64 as a payload size and sends 64 gets `RS485B_ERR_OVERSIZE` from the node that advertised it; that conflation is in the HMTL wire format, not in this bridge. |
 | `MSG_TYPE_SET_ADDR` | `msg_set_addr_t` | Adopts the new address if `device_id` is 0 ("any device") or matches this node's device id; persists it to `cfg.json`. |
 | `MSG_TYPE_SENSOR` | `msg_sensor_data_t` records | Relayed to the WiFi peer and counted. Local handling is the `sensorsync-rs485-transport` follow-up. |
 
@@ -210,8 +210,8 @@ payloads) is counted and ignored; nothing is ever dereferenced past the validate
 
 `Info → RS485 Bridge` shows the address (or `disabled` / `not built` / `error: <reason>`), then
 `RS485 rx/tx`, `RS485 udp in/relayed`, and — only when non-zero — `RS485 dropped`, broken down into
-six figures: bad frames, unsupported commands, transmit-queue drops, rejected datagrams, receive
-timeouts, and framing errors.
+seven figures: bad frames, unsupported commands, transmit-queue drops, rejected datagrams, receive
+timeouts, framing errors, and refused polls.
 
 The last two are worth reading carefully, because they mean different things from the rest:
 

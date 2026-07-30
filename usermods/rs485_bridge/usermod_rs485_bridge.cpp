@@ -465,14 +465,17 @@ void UsermodRS485Bridge::sendPollResponse(uint16_t to) {
   // addressed to SOCKET_ADDR_ANY — and MessageHandler.cpp:81-82 skips its ACK short-circuit precisely
   // for that address, so every stock module would treat it as a fresh poll and answer, each after
   // delay(address * 2). One malformed source address, one bus-wide poll storm.
-  if (to == RS485_ADDR_ANY) { counters.txDropped++; return; }
+  if (!rs485b_should_answer_poll(to)) { counters.pollRefused++; return; }
 
   uint8_t frame[HMTL_MSG_POLL_MIN_LEN];
   const RS485BPollInfo info = { address, effectiveDeviceId(), baud, RS485_RECV_BUFFER };
   // The header carries the REQUESTER's address, not ours — see rs485b_build_poll_response(). A stock
   // HMTL_Module discards a response addressed to the sender's own address.
   const uint8_t len = rs485b_build_poll_response(frame, sizeof(frame), to, info);
-  if (!len) return;
+  // Count a build failure too. It should be unreachable (the buffer is sized from the same constant
+  // the builder checks), but an uncounted early return is invisible, and the bail above now has a
+  // counter — leaving this one silent would be an odd asymmetry to debug around.
+  if (!len) { counters.pollRefused++; return; }
 
   // Goes through the normal transmit queue rather than straight to the wire: a poll response is
   // subject to the same one-frame-per-loop() rate limit as anything else.
@@ -544,16 +547,20 @@ void UsermodRS485Bridge::addToJsonInfo(JsonObject &root) {
     // termination rather than at anything in software.
     const uint16_t framing = rs485.getFramingErrorCount();
     if (errs || counters.unsupported || counters.txDropped || counters.udpRejected || timeouts ||
-        framing) {
+        framing || counters.pollRefused) {
       JsonArray bad = user.createNestedArray(F("RS485 dropped"));
       bad.add(errs);
-      // 128, not 80: five counters plus the literal already ran close enough to 80 that a wide value
-      // would have been truncated, and snprintf_P truncates silently rather than erroring.
-      char buf3[128];
+      // 160, not 80. The original 80 could already truncate at four counters (worst case 84), and each
+      // added figure eats ~20 more; at seven the worst case is 124, which fits 128 with four bytes to
+      // spare — too little to survive the next addition, and snprintf_P truncates silently rather than
+      // erroring, so the failure would be a quietly short info row nobody notices.
+      char buf3[160];
       snprintf_P(buf3, sizeof(buf3),
-                 PSTR(" bad, %u unsupported, %u tx-drop, %u udp-rej, %u timeout, %u framing"),
+                 PSTR(" bad, %u unsupported, %u tx-drop, %u udp-rej, %u timeout, %u framing, "
+                      "%u poll-refused"),
                  (unsigned)counters.unsupported, (unsigned)counters.txDropped,
-                 (unsigned)counters.udpRejected, (unsigned)timeouts, (unsigned)framing);
+                 (unsigned)counters.udpRejected, (unsigned)timeouts, (unsigned)framing,
+                 (unsigned)counters.pollRefused);
       bad.add(buf3);
     }
   }

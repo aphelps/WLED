@@ -422,7 +422,13 @@ int main() {
 
     msg_hdr_t h; memcpy(&h, out, sizeof(h));
     CHECK(h.address == REQUESTER, "header carries the REQUESTER's address");
-    CHECK(h.address != SELF_ADDR, "...which is not our own (the bug this fixes)");
+    // NOT `h.address != SELF_ADDR` — with both operands compile-time constants that is implied by the
+    // line above and can never fail independently, which would inflate this group's apparent strength.
+    // The invariant actually worth pinning is that the HEADER address and the address the frame is
+    // SENT to are the same value; getting those out of step is what made a stock module drop the
+    // response while a permissive one still showed it.
+    CHECK(h.address == REQUESTER && REQUESTER != SELF_ADDR,
+          "header target == send target, and the fixture would expose a swap");
     CHECK(h.type == MSG_TYPE_POLL, "type is POLL");
     CHECK((h.flags & MSG_FLAG_ACK) != 0, "ACK is set: this is a response");
     CHECK(h.length == HMTL_MSG_POLL_MIN_LEN, "declared length matches");
@@ -435,10 +441,31 @@ int main() {
     CHECK(resp.config.address == SELF_ADDR, "config block carries OUR address, not the requester's");
     CHECK(resp.config.device_id == SELF_DEV, "device id");
     CHECK(resp.config.magic == HMTL_CONFIG_MAGIC, "config magic");
+    CHECK(resp.config.protocol_version == HMTL_CONFIG_VERSION, "protocol version");
+    CHECK(resp.config.hardware_version == 1, "hardware version");
+    // num_outputs is the one a stock master acts on: it decides how many output descriptors to parse.
+    // Most likely field to be quietly changed if the bridge ever grows a second output.
+    CHECK(resp.config.num_outputs == 1, "one output advertised");
+    CHECK(resp.config.flags == 0, "config flags clear");
     CHECK(resp.config.baud == BAUD_TO_BYTE(28000), "baud encoded in units of 1200");
     CHECK(resp.object_type == HMTL_OBJECT_TYPE_WLED, "object type marks a WLED bridge");
     CHECK(resp.recv_buffer_size == RS485B_RECV_BUFFER_LEN, "advertised whole-frame budget");
     CHECK(resp.msg_version == HMTL_MSG_VERSION, "message version");
+  }
+
+  // 11c) A poll from the broadcast SOURCE address must not be answered.
+  //
+  // This is the storm guard, and it is deliberately a pure predicate rather than an `if` buried in the
+  // usermod: the usermod lives behind wled.h, so a guard there would have had no behavioural coverage
+  // at all -- a PlatformIO build proves the line compiles, not that it does anything. The plan's Test
+  // Plan originally claimed the 11b storm case covered this; it does not. That case asserts on the
+  // HMTL HEADER address inside rs485b_decide(), while this guards the SOCKET-layer source inside
+  // sendPollResponse() -- different value, different function. Caught in self-review.
+  {
+    CHECK(!rs485b_should_answer_poll(SOCKET_ADDR_ANY),
+          "a poll whose socket source is broadcast is refused (no bus-wide storm)");
+    CHECK(rs485b_should_answer_poll(0x0042), "a poll from a real address is answered");
+    CHECK(rs485b_should_answer_poll(SELF_ADDR), "...including our own address");
   }
 
   // 12) SET_ADDRESS honours the device-id filter.
