@@ -199,8 +199,10 @@ static inline RS485BFrameResult rs485b_validate(const uint8_t *buf, uint16_t ava
 //
 //   buf        — the datagram as read off the socket
 //   len        — bytes actually read
-//   maxPayload — the socket's usable data size, i.e. what RS485Socket::initBuffer() handed back
-//                (RS485_RECV_BUFFER == 64 by default)
+//   maxPayload — the socket's usable data size, i.e. what RS485Socket::initBuffer() handed back.
+//                That is RS485_RECV_BUFFER minus the socket header — 57 by default, NOT 64. The
+//                buffer figure covers the whole frame; confusing the two is what let oversized
+//                frames onto the wire in the first place.
 //
 // Beyond ordinary frame validation this enforces the transmit-side bound, and that bound is a
 // memory-safety requirement rather than a policy: sendMsgTo() takes its length as a `byte` and
@@ -209,9 +211,11 @@ static inline RS485BFrameResult rs485b_validate(const uint8_t *buf, uint16_t ava
 // array. Rejecting here — before the frame is ever queued — is the only place the caller still
 // has the information to say no.
 //
-// Note for bring-up: the usermod's UDP read buffer is only RS485B_TX_SLOT_LEN bytes, so a
-// legal-but-long HMTL frame (up to HMTL_MAX_MSG_LEN == 128) is truncated by udp.read() before it
-// reaches here and is counted as RS485B_ERR_SHORT rather than RS485B_ERR_OVERSIZE.
+// Note for bring-up: the usermod's UDP read buffer is RS485B_RECV_BUFFER_LEN bytes, deliberately one
+// socket header LARGER than a transmit slot. That is what lets a 58..64-byte payload be read whole
+// and refused here as RS485B_ERR_OVERSIZE; sized to the slot instead, udp.read() would truncate it
+// first and it would be miscounted as RS485B_ERR_SHORT. A genuinely long HMTL frame (up to
+// HMTL_MAX_MSG_LEN == 128) is still truncated and counted short.
 static inline RS485BFrameResult rs485b_validate_udp_ingress(const uint8_t *buf, uint16_t len,
                                                             uint16_t maxPayload) {
   RS485BFrameResult r = rs485b_validate(buf, len);
@@ -446,8 +450,9 @@ static inline int rs485b_program_to_mode(uint8_t program) {
 // serial path it raises the driver-enable pin, writes the frame and then calls serial->flush(),
 // busy-waiting until the last bit is on the wire before it can drop DE — it has to, because
 // releasing DE early truncates the frame on a half-duplex bus. At the HMTL-compatible 28000 baud
-// a 64-byte payload becomes roughly 135 wire bytes once Gammon's byte-stuffing and the socket
-// header are counted, i.e. about 48 ms spent inside WLED's loop().
+// a max-size frame is 64 bytes total (57 of payload plus the 7-byte socket header), which Gammon's
+// byte-stuffing doubles to 128 plus STX, ETX and a two-byte CRC -- about 132 wire bytes, i.e. ~47 ms
+// spent inside WLED's loop() at 28000 baud.
 //
 // WLED's loop() also drives the LED refresh and feeds the task watchdog, so an unbounded forward
 // path would let a UDP flood stall the strip or reset the board. The bridge therefore transmits
@@ -458,7 +463,28 @@ static inline int rs485b_program_to_mode(uint8_t program) {
 // delivering and a backlog of stale ones is worse than useless. Fixed-size slots keep it free of
 // heap allocation, which matters in a usermod running for months at a time.
 #define RS485B_TX_SLOTS    4
-#define RS485B_TX_SLOT_LEN 64
+
+// The RS485 socket's total receive budget, mirrored here as a literal for the same reason
+// RS485B_SOCKET_HDR_LEN is: this header must stay free of RS485Utils.h, which pulls in Arduino.h and
+// would make the host test impossible. usermod_rs485_bridge.cpp static_asserts it against the real
+// RS485_RECV_BUFFER so the mirror cannot drift.
+#define RS485B_RECV_BUFFER_LEN 64
+
+// A transmit slot holds a PAYLOAD, and the receiver's budget covers the payload PLUS the socket
+// header -- so the slot must be the buffer minus that header, and it is derived rather than written
+// down to make the mistake it is fixing impossible to repeat.
+//
+// It was hardcoded to 64, the same number as the buffer, which read as obviously-safe and was not:
+// a 64-byte payload reaches the wire as 64 + 7 = 71 bytes and overflows any peer on the default
+// buffer, including this bridge's own receive path. RS485_non_blocking discards the frame and bumps
+// only an internal counter, so a client could submit 64 bytes, watch the tx counter increment, and
+// see the frame vanish with nothing recorded anywhere. The real ceiling is 57.
+//
+// Nothing in the v1 command set came close -- the largest frame the bridge emits is a 23-byte poll
+// response -- but the UDP ingress path accepted up to the slot length, so it was reachable from a
+// WiFi client. It now refuses 58..64 as RS485B_ERR_OVERSIZE, which is countable, instead of
+// accepting them and dropping them silently on the wire.
+#define RS485B_TX_SLOT_LEN (RS485B_RECV_BUFFER_LEN - RS485B_SOCKET_HDR_LEN)
 
 struct RS485BTxQueue {
   uint8_t  buf[RS485B_TX_SLOTS][RS485B_TX_SLOT_LEN];

@@ -90,10 +90,12 @@ class UsermodRS485Bridge : public Usermod {
  private:
   // Work budgets per loop() iteration. Reception is cheap (non-blocking reads of tens of bytes);
   // transmission is not, which is why serviceTx() has a budget of exactly one and needs no
-  // constant here. UDP_BUF_LEN matches a transmit slot because nothing larger can be forwarded.
+  // constant here. UDP_BUF_LEN is deliberately one socket header LARGER than a transmit slot: sized to
+  // the slot, a payload of 58..64 would be truncated by udp.read() and miscounted as a short frame
+  // instead of being read whole and refused as oversize, which is the countable rejection we want.
   static const uint8_t  RX_PER_LOOP  = 4;
   static const uint8_t  UDP_PER_LOOP = 4;
-  static const uint16_t UDP_BUF_LEN  = RS485B_TX_SLOT_LEN;
+  static const uint16_t UDP_BUF_LEN  = RS485B_RECV_BUFFER_LEN;
 
   // config
   bool     enabled    = false;

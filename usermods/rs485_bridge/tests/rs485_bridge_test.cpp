@@ -444,6 +444,25 @@ int main() {
     memset(big + sizeof(msg_hdr_t), 0, RS485B_TX_SLOT_LEN - sizeof(msg_hdr_t));
     CHECK(rs485b_validate_udp_ingress(big, RS485B_TX_SLOT_LEN, RS485B_TX_SLOT_LEN) == RS485B_OK,
           "frame exactly at the buffer limit accepted");
+    // The ceiling in absolute terms, not just relative to the constant.
+    //
+    // Every check above uses RS485B_TX_SLOT_LEN symbolically, so they follow the constant wherever it
+    // goes -- which is right for the relationship and useless for pinning the NUMBER. These two pin it:
+    // 57 is the largest payload a receiver on the default 64-byte budget can actually take once the
+    // 7-byte socket header is counted, and 58 is one too many. The constant read 64 until this was
+    // fixed, so a frame the bridge happily forwarded was dropped on arrival by every peer.
+    CHECK(RS485B_TX_SLOT_LEN == 57, "the payload ceiling is 57, not the buffer size");
+    CHECK(RS485B_TX_SLOT_LEN + RS485B_SOCKET_HDR_LEN == RS485B_RECV_BUFFER_LEN,
+          "payload + socket header exactly fills the receive budget");
+    build_hdr(big, 0x0005, 57, MSG_TYPE_OUTPUT, 0);
+    memset(big + sizeof(msg_hdr_t), 0, 57 - sizeof(msg_hdr_t));
+    CHECK(rs485b_validate_udp_ingress(big, 57, RS485B_TX_SLOT_LEN) == RS485B_OK,
+          "a 57-byte frame is accepted");
+    build_hdr(big, 0x0005, 58, MSG_TYPE_OUTPUT, 0);
+    memset(big + sizeof(msg_hdr_t), 0, 58 - sizeof(msg_hdr_t));
+    CHECK(rs485b_validate_udp_ingress(big, 58, RS485B_TX_SLOT_LEN) == RS485B_ERR_OVERSIZE,
+          "a 58-byte frame is refused as oversize, not accepted then dropped on the wire");
+
     // A datagram that claims more than it delivers is short, not oversize.
     build_hdr(big, 0x0005, 40, MSG_TYPE_OUTPUT, 0);
     CHECK(rs485b_validate_udp_ingress(big, 20, RS485B_TX_SLOT_LEN) == RS485B_ERR_SHORT,

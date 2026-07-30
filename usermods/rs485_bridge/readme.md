@@ -191,13 +191,18 @@ payloads) is counted and ignored; nothing is ever dereferenced past the validate
   defence in depth against a library built without that fix, and the "payload must not be empty" test
   is the usermod's own.
 * **Transmit is rate-bounded.** `RS485Socket::sendMsgTo` blocks: it calls `serial->flush()` while
-  holding DE high, so a 64-byte payload at 28000 baud is ≈48 ms of busy-wait once Gammon's
+  holding DE high, so a max-size 64-byte frame at 28000 baud is ≈47 ms of busy-wait once Gammon's
   byte-stuffing is counted. The bridge therefore transmits **at most one frame per `loop()`
   iteration** and parks the rest in a 4-slot ring buffer, dropping the oldest on overflow. A UDP
   flood cannot stall the LED refresh or trip the watchdog.
-* **Ingress size cap.** A datagram whose declared `length` exceeds the socket data buffer (64 B)
-  is rejected before it reaches `sendMsgTo`, whose `datalength` argument is a `byte` and which
-  writes the socket header *in front of* the caller's buffer.
+* **Ingress size cap — 57 bytes of payload, not 64.** `RS485_RECV_BUFFER` (64 B) is the budget for
+  the whole *frame*, socket header included, so the usable payload is `64 - 7 = 57`. A datagram
+  declaring more is rejected as `RS485B_ERR_OVERSIZE` before it reaches `sendMsgTo`, whose
+  `datalength` argument is a `byte` and which writes the socket header *in front of* the caller's
+  buffer. The cap used to be 64, which meant a full-size payload went on the wire as 71 bytes and
+  was silently dropped by every peer on the default buffer, including this bridge's own receiver.
+  `RS485B_TX_SLOT_LEN` is now derived as `RS485B_RECV_BUFFER_LEN - RS485B_SOCKET_HDR_LEN` so the two
+  cannot drift apart again.
 * **Relay target.** Responses and non-local traffic go to the IP/port of the most recent WiFi
   datagram. There is no peer table in v1.
 
