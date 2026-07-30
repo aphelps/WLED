@@ -454,6 +454,17 @@ int main() {
     CHECK(RS485B_TX_SLOT_LEN == 57, "the payload ceiling is 57, not the buffer size");
     CHECK(RS485B_TX_SLOT_LEN + RS485B_SOCKET_HDR_LEN == RS485B_RECV_BUFFER_LEN,
           "payload + socket header exactly fills the receive budget");
+    // Tie the arithmetic to a real struct rather than to the mirrored literal. Group 1 already builds
+    // a packed replica of rs485_socket_hdr_t under both ABIs; using its sizeof here makes the WHOLE
+    // relationship host-verifiable, and this runs in CI whereas the static_assert against the real
+    // RS485_RECV_BUFFER compiles only under [env:ampworks], which no workflow builds.
+    struct __attribute__((__packed__)) hdrForBudget {
+      uint8_t ID; uint8_t length; uint16_t source; uint16_t address; uint8_t flags;
+    };
+    CHECK(sizeof(hdrForBudget) == RS485B_SOCKET_HDR_LEN,
+          "the socket header the budget is computed against is really 7 bytes");
+    CHECK(RS485B_TX_SLOT_LEN + sizeof(hdrForBudget) == RS485B_RECV_BUFFER_LEN,
+          "slot + real header size fills the budget exactly");
     build_hdr(big, 0x0005, 57, MSG_TYPE_OUTPUT, 0);
     memset(big + sizeof(msg_hdr_t), 0, 57 - sizeof(msg_hdr_t));
     CHECK(rs485b_validate_udp_ingress(big, 57, RS485B_TX_SLOT_LEN) == RS485B_OK,
@@ -462,6 +473,23 @@ int main() {
     memset(big + sizeof(msg_hdr_t), 0, 58 - sizeof(msg_hdr_t));
     CHECK(rs485b_validate_udp_ingress(big, 58, RS485B_TX_SLOT_LEN) == RS485B_ERR_OVERSIZE,
           "a 58-byte frame is refused as oversize, not accepted then dropped on the wire");
+
+    // A 64-byte datagram carrying a VALID short frame plus trailing bytes is still accepted, and
+    // forwarded at h.length rather than at the datagram length. This path is new: serviceUdp() now
+    // reads up to 64 (one header more than a slot) and then trusts h.length, so "read more than a
+    // slot" must not be mistaken for "forward more than a slot".
+    memset(big, 0, sizeof(big));
+    build_hdr(big, 0x0005, 40, MSG_TYPE_OUTPUT, 0);
+    memset(big + sizeof(msg_hdr_t), 0xAB, 40 - sizeof(msg_hdr_t));
+    // ...then 24 bytes of trailing junk, taking the datagram to a full 64.
+    memset(big + 40, 0x5A, 24);
+    CHECK(rs485b_validate_udp_ingress(big, 64, RS485B_TX_SLOT_LEN) == RS485B_OK,
+          "a full-size datagram holding a short valid frame is accepted");
+    {
+      msg_hdr_t h;
+      memcpy(&h, big, sizeof(h));
+      CHECK(h.length == 40, "and it is the frame's own length that gets forwarded, not the datagram's");
+    }
 
     // A datagram that claims more than it delivers is short, not oversize.
     build_hdr(big, 0x0005, 40, MSG_TYPE_OUTPUT, 0);

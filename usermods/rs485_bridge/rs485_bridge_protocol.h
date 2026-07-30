@@ -199,10 +199,14 @@ static inline RS485BFrameResult rs485b_validate(const uint8_t *buf, uint16_t ava
 //
 //   buf        — the datagram as read off the socket
 //   len        — bytes actually read
-//   maxPayload — the socket's usable data size, i.e. what RS485Socket::initBuffer() handed back.
-//                That is RS485_RECV_BUFFER minus the socket header — 57 by default, NOT 64. The
-//                buffer figure covers the whole frame; confusing the two is what let oversized
-//                frames onto the wire in the first place.
+//   maxPayload — the largest payload the transmit array can carry AND a receiver on the default budget
+//                can accept: RS485_RECV_BUFFER minus the 7-byte socket header, i.e. 57, not 64. The
+//                buffer figure covers the whole frame; confusing the two is what let oversized frames
+//                onto the wire in the first place.
+//                Note where that bound actually lives: the transmit array is sized to match
+//                (rawTxBuf in usermod_rs485_bridge.h). RS485Socket::initBuffer() only returns an
+//                offset pointer and enforces no size at all — its data_size argument feeds a debug
+//                print — so do not go looking for the 57 there.
 //
 // Beyond ordinary frame validation this enforces the transmit-side bound, and that bound is a
 // memory-safety requirement rather than a policy: sendMsgTo() takes its length as a `byte` and
@@ -480,9 +484,11 @@ static inline int rs485b_program_to_mode(uint8_t program) {
 // only an internal counter, so a client could submit 64 bytes, watch the tx counter increment, and
 // see the frame vanish with nothing recorded anywhere. The real ceiling is 57.
 //
-// Nothing in the v1 command set came close -- the largest frame the bridge emits is a 23-byte poll
-// response -- but the UDP ingress path accepted up to the slot length, so it was reachable from a
-// WiFi client. It now refuses 58..64 as RS485B_ERR_OVERSIZE, which is countable, instead of
+// Nothing in the v1 command set came close. The largest frame the bridge EMITS is the 23-byte poll
+// response; the largest it can RELAY is bounded by what an HMTL node can put on the bus, which is
+// MessageHandler::MSG_MAX_SZ == sizeof(msg_hdr_t) + sizeof(msg_program_t) == 43. (Earlier notes said
+// "35-byte PROGRAM" -- that is sizeof(msg_program_t) alone, without the 8-byte header.) But the UDP
+// ingress path accepted up to the slot length, so 64 was reachable from a WiFi client. It now refuses 58..64 as RS485B_ERR_OVERSIZE, which is countable, instead of
 // accepting them and dropping them silently on the wire.
 #define RS485B_TX_SLOT_LEN (RS485B_RECV_BUFFER_LEN - RS485B_SOCKET_HDR_LEN)
 
