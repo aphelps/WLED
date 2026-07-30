@@ -151,6 +151,8 @@ class UsermodSensorSync : public Usermod {
   // Off by default: with this on, every local UI/API change is broadcast to the whole
   // installation, which is a large behaviour change to opt into rather than inherit on upgrade.
   bool     gateway    = false;   // act as a control gateway (publish local state changes)
+  // Set by onStateChange (which may run on the AsyncTCP task), consumed by loop().
+  volatile bool controlPending = false;
 
   // Both transports are owned; `transport` points at the active one (defaults to UDP, so an
   // unconfigured device broadcasts over UDP). Selection swaps the pointer.
@@ -191,6 +193,7 @@ class UsermodSensorSync : public Usermod {
   // touches no ordering state. The gateway path needs the effect without the decision.
   void applyControl(const SensorSyncHeader &h, const SensorControl &c);
   void applyControlFields(const SensorControl &c);
+  void publishPendingControl();
   void broadcastLocalState();
   void sweepPeers();
 };

@@ -97,6 +97,7 @@ void UsermodSensorSync::loop() {
   }
 
   receiveLoop();
+  publishPendingControl();
   broadcastLocalState();
   sweepPeers();
 }
@@ -172,20 +173,23 @@ bool UsermodSensorSync::publishControl(const SensorControl &cmd) {
   SensorControl c = cmd;
   c.lamport = ss_ctrl_tick(control);      // our command competes in the same total order as any other
 
-  // Record our own command BEFORE applying it. Skipping this was a real bug: it left `have` false,
-  // so the next stale command to arrive would be accepted here while every peer correctly rejected
-  // it, and the installation would sit split until something newer came along.
+  // Broadcast BEFORE recording or applying. Ordering matters: recording a command the mesh never
+  // received would leave this node holding state nobody else has, and then rejecting the peer
+  // command everyone else applied — the same divergence as not recording at all, moved to the
+  // failure path. On a send failure we change nothing locally, so the node stays consistent with
+  // the installation and the user simply taps again.
+  //
+  // There is deliberately no retry queue: control is user-driven, and a queue would need its own
+  // ordering story against commands issued while it drained.
+  if (!sendMessage(SENSOR_SYNC_MSG_CONTROL, 0,
+                   reinterpret_cast<const uint8_t *>(&c), sizeof(c))) return false;
+
+  // Record our own command: this node competes in the same total order it imposes on everyone
+  // else. Skipping it left `have` false, so the next stale command was accepted here while every
+  // peer correctly rejected it.
   ss_ctrl_record_own(control, c.lamport, deviceId);
-
-  // Apply locally first so the phone sees its own node respond without waiting for a round trip.
-  // Safe against our own echo: the frame carries this deviceId, which ss_ctrl_should_apply rejects.
   applyControlFields(c);
-
-  // A send failure leaves this node applied and the rest of the mesh not. There is deliberately no
-  // retry or reconciliation: control is user-driven and re-issuing is a tap away, whereas a retry
-  // queue would need its own ordering story against commands issued in the meantime.
-  return sendMessage(SENSOR_SYNC_MSG_CONTROL, 0,
-                     reinterpret_cast<const uint8_t *>(&c), sizeof(c));
+  return true;
 }
 
 bool UsermodSensorSync::publishPreset(uint8_t presetId) {
@@ -254,6 +258,22 @@ void UsermodSensorSync::applyControl(const SensorSyncHeader &h, const SensorCont
 void UsermodSensorSync::onStateChange(uint8_t mode) {
   if (!enabled || !gateway || !started) return;
   if (mode != CALL_MODE_DIRECT_CHANGE && mode != CALL_MODE_BUTTON && mode != CALL_MODE_ALEXA) return;
+
+  // Do NOT publish from here. This runs wherever the state change came from, and for the most
+  // common case — POST /json/state — that is the AsyncTCP task, not loop(). Publishing inline would
+  // race txSeq, the ControlState, and the transport against loop()'s own use of them. Set a flag
+  // and let loop() do the work on the task that owns those.
+  //
+  // Coalescing to a single pending flag is deliberate: several state fields changing in one
+  // interaction should reach the mesh as one command, not one per field.
+  controlPending = true;
+}
+
+// Runs on the loop() task. Reads the state as it now stands, which is also why coalescing is
+// correct — whatever the final state of a burst of changes is, that is what the mesh should get.
+void UsermodSensorSync::publishPendingControl() {
+  if (!controlPending) return;
+  controlPending = false;
 
   Segment &seg = strip.getMainSegment();
   SensorControl c{};

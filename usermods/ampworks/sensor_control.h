@@ -50,8 +50,17 @@ static inline uint32_t ss_ctrl_tick(ControlState &st) {
 // every received command, INCLUDING ones we decline to apply — otherwise a node that lost a race
 // would keep issuing commands that lose, and a node that had rebooted (clock back to 0) could
 // never catch up.
+// The clamp is not defensive tidiness. Without it one frame carrying lamport = 0xFFFFFFFF wraps
+// every command this node subsequently originates back to 0, so every peer rejects them forever:
+// a one-packet permanent DoS on an unauthenticated open broadcast. A jump of more than
+// SS_CTRL_MAX_JUMP past our own clock is not a real installation getting ahead of us, so we decline
+// to follow it — a genuine peer that far ahead would have to have issued 2^20 commands unheard.
+#define SS_CTRL_MAX_JUMP  0x00100000UL   // ~1M commands
+
 static inline void ss_ctrl_observe(ControlState &st, uint32_t heardClock) {
-  if (heardClock > st.clock) st.clock = heardClock;
+  if (heardClock <= st.clock) return;
+  if (heardClock - st.clock > SS_CTRL_MAX_JUMP) return;   // implausible: ignore rather than follow
+  st.clock = heardClock;
 }
 
 // Record a command this node originated. The originator MUST do this: it is competing in the same
