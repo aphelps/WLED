@@ -118,6 +118,11 @@ class UsermodSensorSync : public Usermod {
 
   uint32_t getDeviceId() const { return deviceId; }
 
+  // WLED fires this from stateUpdated() on every state change. This is the gateway path: a
+  // user-driven change here is put onto the mesh. See the implementation for which call modes
+  // count as user-driven and why that is what suppresses echo.
+  void onStateChange(uint8_t mode) override;
+
   uint16_t getId() override;
   void addToJsonInfo(JsonObject &root) override;
   void addToConfig(JsonObject &root) override;
@@ -143,6 +148,9 @@ class UsermodSensorSync : public Usermod {
   uint32_t deviceId   = 0;
   uint32_t keyframeMs = 3000;    // periodic full-snapshot re-broadcast (0 = off)
   bool     useEspNow  = false;   // false = UDP (default, unchanged behavior); true = ESP-NOW
+  // Off by default: with this on, every local UI/API change is broadcast to the whole
+  // installation, which is a large behaviour change to opt into rather than inherit on upgrade.
+  bool     gateway    = false;   // act as a control gateway (publish local state changes)
 
   // Both transports are owned; `transport` points at the active one (defaults to UDP, so an
   // unconfigured device broadcasts over UDP). Selection swaps the pointer.

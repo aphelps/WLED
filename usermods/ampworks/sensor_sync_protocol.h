@@ -35,7 +35,7 @@
 #define SENSOR_SYNC_MSG_ATTACH     3   // node announcing itself to a router (attach + keepalive)
 #define SENSOR_SYNC_MSG_ATTACH_ACK 4   // router accepting an attach, granting a membership lease
 #define SENSOR_SYNC_MSG_CONTROL    5   // a UI/preset command from a gateway node (multi-hop)
-#define SENSOR_SYNC_MSG_TIMEBASE   6   // reserved: periodic timebase beacon (see SensorControl.timebase)
+#define SENSOR_SYNC_MSG_TIMEBASE   6   // reserved: periodic timebase beacon (unimplemented)
 
 // Multi-hop relay. TTL bounds flood diameter; per-origin seq dedup terminates loops. The
 // origin stamps SS_DEFAULT_TTL; each relay re-broadcasts with ttl-1 and drops once ttl would reach 0.
@@ -70,7 +70,6 @@ struct __attribute__((packed)) SensorSnapshot {
   uint16_t mask;       // bit e set = channel e active/closed
 };
 
-// Scalar per-channel sample — SS_SENSOR_PROXIMITY (0..255) and SS_SENSOR_TEMP (centi-deg C).
 // Control-plane field selector. One frame carries however many of the fields below are meaningful,
 // so "blink, on this palette, at this brightness" arrives as ONE frame and applies atomically —
 // rather than as three frames that can interleave with a competing gateway's.
@@ -79,17 +78,24 @@ struct __attribute__((packed)) SensorSnapshot {
 #define SS_CTRL_PALETTE     0x04
 #define SS_CTRL_BRIGHTNESS  0x08
 #define SS_CTRL_COLOUR      0x10
-#define SS_CTRL_TIMEBASE    0x20  // `timebase` is meaningful (see below; not consumed yet)
+// (0x20 is free — SS_CTRL_TIMEBASE was removed; the header's `timestamp` already carries the
+// phase anchor a future timebase-sync needs, so no extra field or flag is required.)
 
 // A control command. 16 bytes, so header+payload is 36 of the 84-byte budget — no fragmentation,
 // no per-node RAM change. Deliberately a fixed struct rather than JSON: see SENSOR_SYNC.md.
 //
-// `timebase` is on the wire from the first release but NOT consumed yet. Effects derive all their
-// timing from `strip.now`, which WLED computes as `millis() + Segment::timebase` ("common time base
-// for all effects", FX_fcn.cpp), and WLED's own UDP sync has propagated exactly this value since its
-// protocol v6. So phase-aligning effects across the mesh is a matter of agreeing on this one u32,
-// not of touching effects — but deciding relay-delay compensation is its own task. Carrying the
-// field now means that task never has to break the wire format.
+// `lamport` is the ordering key, NOT a wall clock. It is a Lamport logical clock: bumped on every
+// command a node originates, and raised to any higher value it hears. Ordered by (lamport,
+// deviceId) it is a genuine total order — transitive and antisymmetric — so every node picks the
+// same winner from the same set of commands.
+//
+// The header's `timestamp` is deliberately NOT the ordering key, though it looks like the obvious
+// candidate. It is `millis() + Segment::timebase`, which is a per-node quantity: nothing assigns
+// `timebase` from the mesh leader, WLED's own sync rewrites it, and `resetTimebase()` zeroes it
+// whenever the strip switches on. Two nodes therefore do not share that clock, so ordering by it
+// would let a freshly-booted node lose every comparison for days, and would put commands far
+// enough apart to reach the ambiguous half of any wraparound-safe compare — where "newer" stops
+// being transitive and nodes can settle on different states permanently.
 struct __attribute__((packed)) SensorControl {
   uint8_t  fields;      // SS_CTRL_* bitmask: which of the following are meaningful
   uint8_t  presetId;    // preset to apply (1..250)
@@ -98,10 +104,11 @@ struct __attribute__((packed)) SensorControl {
   uint8_t  brightness;  // 0..255
   uint8_t  _rsv0;       // reserved; must be 0
   uint16_t _rsv1;       // reserved; must be 0 — pads the u32s below to 4-byte alignment
-  uint32_t colour;      // 0x00WWRRGGBB
-  uint32_t timebase;    // origin's Segment::timebase, for effect phase alignment
+  uint32_t colour;      // 0x00RRGGBB, or 0xWWRRGGBB with a white channel
+  uint32_t lamport;     // logical clock; primary ordering key (see above)
 };
 
+// Scalar per-channel sample — SS_SENSOR_PROXIMITY (0..255) and SS_SENSOR_TEMP (centi-deg C).
 struct __attribute__((packed)) SensorSample {
   uint8_t  channel;    // which sensor of this type on the origin device
   int16_t  value;      // proximity level, or temperature in centi-degrees

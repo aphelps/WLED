@@ -13,34 +13,54 @@
 #include <string.h>
 #include "sensor_sync_protocol.h"
 
-// Wraparound-safe "is a strictly newer than b" for the header's 32-bit timestamp, matching what
-// ss_seq_newer does for 16-bit sequence numbers. Without this a timestamp rolling through zero
-// would make every subsequent command look older than the last one applied, and the installation
-// would stop responding until it caught back up.
-static inline bool ss_ts_newer(uint32_t a, uint32_t b) {
-  return a != b && (uint32_t)(a - b) < 0x80000000UL;
-}
-
-// Total order over commands, so that two gateways issuing conflicting commands converge on the
-// same winner rather than fighting. Primary key is the leader-owned timestamp; deviceId breaks
-// ties, which matters because two phones acting in the same millisecond is not exotic when a
-// timestamp has millisecond resolution. Deterministic and stateless: every node picks the same
-// winner without agreeing on anything beyond the frames themselves.
-static inline bool ss_ctrl_newer(uint32_t aTs, uint32_t aDev, uint32_t bTs, uint32_t bDev) {
-  if (aTs != bTs) return ss_ts_newer(aTs, bTs);
+// Total order over commands: higher Lamport clock wins, deviceId breaks ties. Plain comparisons,
+// because a Lamport clock only ever increases — so unlike a wall clock this needs no wraparound
+// trickery, and crucially it IS transitive. An RFC-1982-style compare is only an order within a
+// half-range window: with values spread wider than 2^31 you can have a<b and b<c but not a<c, and
+// two nodes seeing the same commands in different orders then settle on different states forever.
+//
+// This deliberately does not use the header's `timestamp`. That is `millis() + Segment::timebase`,
+// a per-node quantity — nothing assigns `timebase` from the mesh leader, WLED's own sync rewrites
+// it, and `resetTimebase()` zeroes it whenever the strip switches on — so it is not a shared clock
+// and ordering by it would be unsound in exactly the way described above.
+static inline bool ss_ctrl_newer(uint32_t aClock, uint32_t aDev, uint32_t bClock, uint32_t bDev) {
+  if (aClock != bClock) return aClock > bClock;
   return aDev > bDev;
 }
 
-// What a node remembers about the last command it applied. Two u32s and a flag — no per-origin
-// table, because the order is total: only the current winner needs remembering.
+// What a node remembers about the last command it applied, plus its own logical clock. No
+// per-origin table: the order is total, so only the current winner needs remembering.
 struct ControlState {
-  uint32_t lastTs;
+  uint32_t lastClock;
   uint32_t lastDev;
+  uint32_t clock;      // our Lamport clock
   bool     have;
 };
 
 static inline ControlState ss_ctrl_init() {
-  return ControlState{ 0, 0, false };
+  return ControlState{ 0, 0, 0, false };
+}
+
+// Stamp an outgoing command: bump our clock and return the value to put on the wire.
+static inline uint32_t ss_ctrl_tick(ControlState &st) {
+  return ++st.clock;
+}
+
+// Raise our clock to at least what we just heard, so our next command sorts after it. Called for
+// every received command, INCLUDING ones we decline to apply — otherwise a node that lost a race
+// would keep issuing commands that lose, and a node that had rebooted (clock back to 0) could
+// never catch up.
+static inline void ss_ctrl_observe(ControlState &st, uint32_t heardClock) {
+  if (heardClock > st.clock) st.clock = heardClock;
+}
+
+// Record a command this node originated. The originator MUST do this: it is competing in the same
+// total order as everyone else, and skipping it leaves `have` false so the next stale command to
+// arrive is accepted here while every peer correctly rejects it — a divergence that persists.
+static inline void ss_ctrl_record_own(ControlState &st, uint32_t clock, uint32_t selfId) {
+  st.lastClock = clock;
+  st.lastDev   = selfId;
+  st.have      = true;
 }
 
 // Should this command be applied? Rejects, in order:
@@ -50,13 +70,14 @@ static inline ControlState ss_ctrl_init() {
 //   - anything not strictly newer than what we already applied, which is what makes a late or
 //     duplicated frame from a slower path harmless.
 // Updates `st` only when it returns true.
-static inline bool ss_ctrl_should_apply(ControlState &st, uint32_t ts, uint32_t dev,
+static inline bool ss_ctrl_should_apply(ControlState &st, uint32_t clock, uint32_t dev,
                                         uint32_t selfId) {
+  ss_ctrl_observe(st, clock);   // even a rejected command advances our clock
   if (dev == selfId) return false;
-  if (st.have && !ss_ctrl_newer(ts, dev, st.lastTs, st.lastDev)) return false;
-  st.lastTs  = ts;
-  st.lastDev = dev;
-  st.have    = true;
+  if (st.have && !ss_ctrl_newer(clock, dev, st.lastClock, st.lastDev)) return false;
+  st.lastClock = clock;
+  st.lastDev   = dev;
+  st.have      = true;
   return true;
 }
 

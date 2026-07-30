@@ -154,10 +154,10 @@ bool UsermodSensorSync::publishSample(uint8_t sensorType, uint8_t channel, int16
 // once instead of waiting for a round trip, and it costs nothing in convergence: our own frame is
 // stamped with this node's deviceId, so ss_ctrl_should_apply rejects it if it loops back to us.
 //
-// The local apply deliberately does NOT go through applyControl() — that function's job is to
-// decide about a REMOTE command, and running our own through it would record us as the winner in
-// `control`, which would then reject a genuinely newer remote command arriving in the same
-// millisecond from a higher deviceId. The originator stays out of its own ordering state.
+// It does not route through applyControl(), which owns the decision for a REMOTE frame; the
+// originator records itself explicitly instead (below). Recording is not optional — an earlier
+// version skipped it on the theory that it would block a same-clock higher-deviceId command, which
+// is simply false: the deviceId tie-break admits that command either way.
 //
 // INVARIANT — nothing may broadcast control state except an explicit local command.
 // This is what makes roaming safe: when a phone moves to another node, that node must not announce
@@ -167,11 +167,23 @@ bool UsermodSensorSync::publishSample(uint8_t sensorType, uint8_t channel, int16
 // snapshots get for reliability: a re-sent old command would be indistinguishable from a new one to
 // a node that had rebooted and lost its ordering state, and would resurrect state the user had
 // already moved on from.
-bool UsermodSensorSync::publishControl(const SensorControl &c) {
+bool UsermodSensorSync::publishControl(const SensorControl &cmd) {
   if (!started) return false;
-  // Timestamps come from the shared timebase, which is what makes the ordering rule meaningful
-  // across nodes rather than just within one.
+  SensorControl c = cmd;
+  c.lamport = ss_ctrl_tick(control);      // our command competes in the same total order as any other
+
+  // Record our own command BEFORE applying it. Skipping this was a real bug: it left `have` false,
+  // so the next stale command to arrive would be accepted here while every peer correctly rejected
+  // it, and the installation would sit split until something newer came along.
+  ss_ctrl_record_own(control, c.lamport, deviceId);
+
+  // Apply locally first so the phone sees its own node respond without waiting for a round trip.
+  // Safe against our own echo: the frame carries this deviceId, which ss_ctrl_should_apply rejects.
   applyControlFields(c);
+
+  // A send failure leaves this node applied and the rest of the mesh not. There is deliberately no
+  // retry or reconciliation: control is user-driven and re-issuing is a tap away, whereas a retry
+  // queue would need its own ordering story against commands issued in the meantime.
   return sendMessage(SENSOR_SYNC_MSG_CONTROL, 0,
                      reinterpret_cast<const uint8_t *>(&c), sizeof(c));
 }
@@ -180,8 +192,7 @@ bool UsermodSensorSync::publishPreset(uint8_t presetId) {
   SensorControl c{};
   c.fields   = SS_CTRL_PRESET;
   c.presetId = presetId;
-  c.timebase = strip.timebase;   // reserved for phase-lock; carried from the first release
-  return publishControl(c);
+  return publishControl(c);      // publishControl stamps c.lamport
 }
 
 // --- control plane: apply path ---
@@ -216,18 +227,42 @@ void UsermodSensorSync::applyControlFields(const SensorControl &c) {
   }
   if (changed) stateUpdated(CALL_MODE_NO_NOTIFY);
 
-  // c.timebase is intentionally not consumed yet — see SensorControl in sensor_sync_protocol.h.
 }
 
 // Decide whether a REMOTE command should be applied, then apply it. The decision is pure and lives
 // in sensor_control.h, so the conflict rule and echo suppression are host-tested rather than only
 // exercised on hardware.
 void UsermodSensorSync::applyControl(const SensorSyncHeader &h, const SensorControl &c) {
-  if (!ss_ctrl_should_apply(control, h.timestamp, h.deviceId, deviceId)) return;
+  // Ordering is on c.lamport, NOT h.timestamp — see sensor_control.h for why the header timestamp
+  // is not a shared clock. should_apply also advances our own clock from what we heard.
+  if (!ss_ctrl_should_apply(control, c.lamport, h.deviceId, deviceId)) return;
   applyControlFields(c);
   // Deliberately NOT re-broadcast. The router's per-origin dedup stops a frame circulating the
   // backbone, but nothing stops an edge from re-originating what it just applied under its OWN
   // deviceId — which would defeat that dedup entirely and flood the mesh.
+}
+
+// --- control plane: gateway hook ---
+// WLED calls this from stateUpdated() for every state change, with the callMode that caused it.
+// Only genuinely user-driven modes originate a mesh command.
+//
+// Filtering on callMode is also what suppresses echo at this layer, and it is why applyControlFields
+// uses CALL_MODE_NO_NOTIFY: a command we applied from the mesh comes back through here as
+// NO_NOTIFY and is ignored, so it cannot be re-originated under our own deviceId. Likewise
+// CALL_MODE_NOTIFICATION (WLED's own sync) is excluded, so the two sync mechanisms do not feed
+// each other.
+void UsermodSensorSync::onStateChange(uint8_t mode) {
+  if (!enabled || !gateway || !started) return;
+  if (mode != CALL_MODE_DIRECT_CHANGE && mode != CALL_MODE_BUTTON && mode != CALL_MODE_ALEXA) return;
+
+  Segment &seg = strip.getMainSegment();
+  SensorControl c{};
+  c.fields     = SS_CTRL_EFFECT | SS_CTRL_PALETTE | SS_CTRL_BRIGHTNESS | SS_CTRL_COLOUR;
+  c.effectId   = seg.mode;
+  c.paletteId  = seg.palette;
+  c.brightness = bri;
+  c.colour     = seg.colors[0];
+  publishControl(c);
 }
 
 // --- receive ---
@@ -318,6 +353,7 @@ void UsermodSensorSync::addToConfig(JsonObject &root) {
   top["port"]       = port;
   top["id"]         = configId;
   top["keyframeMs"] = keyframeMs;
+  top["gateway"]    = gateway;
   top["useEspNow"]  = useEspNow;   // false = UDP (default); true = ESP-NOW broadcast
 }
 
@@ -330,6 +366,7 @@ bool UsermodSensorSync::readFromConfig(JsonObject &root) {
   getJsonValue(top["port"], port);
   getJsonValue(top["id"],   configId);
   getJsonValue(top["keyframeMs"], keyframeMs);
+  getJsonValue(top["gateway"], gateway);
   getJsonValue(top["useEspNow"], useEspNow);
 #ifdef WLED_DISABLE_ESPNOW
   useEspNow = false;   // no ESP-NOW in this build — force UDP regardless of cfg
