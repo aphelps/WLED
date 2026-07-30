@@ -128,6 +128,15 @@ int main() {
 
   // 1) Wire layout is what legacy HMTL modules expect.
   {
+    // The RS485 socket header wraps every HMTL frame on the wire, and its size is what places the
+    // payload at both ends. It is 7 bytes because RS485Utils packs the struct; unpacked it would be 7
+    // on AVR and 8 on this host, and a bridge built with 8 misparses every frame a real ATMega328
+    // module sends (and vice versa). Asserted here rather than only in usermod_rs485_bridge.cpp
+    // because that file's static_assert against the real struct compiles ONLY in [env:ampworks],
+    // which no CI workflow builds — this test, run plain and again under -fpack-struct=1, is the
+    // only automated place the constant is checked on both ABIs.
+    CHECK(RS485B_SOCKET_HDR_LEN == 7, "RS485 socket header is 7B on every target");
+
     CHECK(sizeof(msg_hdr_t) == 8, "msg_hdr_t is 8B");
     CHECK(sizeof(msg_rgb_t) == 5, "msg_rgb_t is 5B");
     CHECK(sizeof(msg_value_t) == 4, "msg_value_t is 4B");

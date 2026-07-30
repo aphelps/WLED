@@ -39,6 +39,24 @@ Both flags are load-bearing:
 cd WLED && pio run -e ampworks
 ```
 
+### ⚠ After editing anything in `ArduinoLibs`, clear `.pio/libdeps` first
+
+`lib_deps` lists the ArduinoLibs directories by path, so PlatformIO **copies** them into
+`.pio/libdeps/<env>/<Lib>/` and then builds against that copy. It does not reliably re-sync the copy
+when the source changes, so a header edit in `ArduinoLibs/` can be silently invisible:
+
+```bash
+rm -rf .pio/libdeps/ampworks/RS485Utils     # and any other ArduinoLibs dir you touched
+pio run -e ampworks
+```
+
+This is not theoretical. While fixing the socket-header packing, `pio run -e ampworks` reported
+SUCCESS against a `RS485B_SOCKET_HDR_LEN` that was deliberately wrong — the build was reading a
+cached, pre-fix copy of `RS485Utils.h`, so the `static_assert` meant to catch exactly that mismatch
+never saw the new struct. Recompiling the usermod (`touch`ing the `.cpp`) was not enough; only
+deleting the `libdeps` copy was. **Before flashing anything you intend to test on hardware, clear the
+copy** — otherwise the binary can disagree with the source you are reading.
+
 ### Why the build guard exists
 
 Adding `usermods/rs485_bridge/library.json` automatically enrols this directory in two builds
