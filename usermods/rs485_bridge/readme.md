@@ -66,6 +66,17 @@ wire-layout `static_assert`s are covered by `pio run -e ampworks` and by the hos
 nothing when no serial backend is available — the CI workflows put ArduinoLibs on
 `PLATFORMIO_LIB_EXTRA_DIRS`, which is enough for the library dependency finder to pull it in.
 
+The build guard alone is **not** enough to keep RS485Utils out of `[env:usermods]`, though.
+PlatformIO's dependency finder runs in `chain` mode, which scans `#include` lines *without*
+evaluating preprocessor conditionals: it sees `#include "RS485Utils.h"` inside the disabled
+`#if RS485_BRIDGE_BUILD` block regardless, pulls RS485Utils out of ArduinoLibs and compiles it —
+and `RS485Utils.cpp` includes `<RS485_non_blocking.h>` above its own guard, so the build fails
+outright if that sibling library is missing. The CI workflows clone ArduinoLibs' *default* branch,
+which need not have it. `[env:usermods]` therefore sets `lib_ignore = RS485Utils`: with the bridge
+compiled out, no translation unit in that env can reference an RS485Utils symbol, so dropping the
+library from the dependency graph is what actually matches reality. If the RS485 build flags are
+ever added to that env, the ignore has to go with them.
+
 ## Wiring
 
 A 3.3 V-tolerant RS485 transceiver (MAX3485 / SP3485 / SN65HVD75) with a single driver-enable
