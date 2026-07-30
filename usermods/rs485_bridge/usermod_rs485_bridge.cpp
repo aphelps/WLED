@@ -123,7 +123,28 @@ void UsermodRS485Bridge::setup() {
   // compile-time RS485_HARDWARE_SERIAL macro, which makes runtime baud/UART config impossible.
   // RS485Socket::setup() skips serial->begin() under ESP32, so it will not undo the settings.
   rs485.init(port, (byte)enPin, address, RS485_RECV_BUFFER, false);
+  // The receive timeout defaults to a value sized for RS485Socket::DEFAULT_BAUD. `baud` here is
+  // user-settable, and at a slower rate a maximal frame legitimately spends longer on the wire than
+  // that default allows — which would abandon every full-size frame mid-flight and leave the bridge
+  // deaf to large frames while small ones still worked. Scale it to whatever the port is actually
+  // running at.
+  rs485.setPacketTimeoutForBaud(baud);
   rs485.setup();
+
+  // RS485Socket::setup() is where the receive buffer is allocated, and that allocation can fail —
+  // silently, and in the worst possible way: RS485::update() simply returns false forever, so the
+  // bridge would transmit happily while never receiving a single frame, with /json/info reporting
+  // itself healthy. Ask the socket whether it actually came up (initialized() covers the serial, the
+  // channel object and the channel's buffer) and refuse to run if it did not, so the failure shows up
+  // as `error: rs485 alloc failed` instead of a bridge that looks fine and is deaf.
+  if (!rs485.initialized()) {
+    failReason = PSTR("rs485 alloc failed");
+    releasePins();
+    delete port;
+    port = nullptr;
+    DEBUG_PRINTF_P(PSTR("[RS485Bridge] disabled: %s\n"), failReason);
+    return;
+  }
   // initBuffer() carves rawTxBuf into [socket header][data] and returns a pointer to the data
   // region. sendMsgTo() writes its header immediately in front of the pointer it is given, so
   // transmissions must go through this pointer and no other.
@@ -172,18 +193,34 @@ void UsermodRS485Bridge::serviceRs485() {
     // RS485_ADDR_ANY: take every frame off the bus, then decide locally whether it is ours.
     // Frames for other nodes are still useful — they are relayed back to the WiFi peer, which is
     // what lets a WiFi client observe replies from the legacy modules it commanded.
+    // RS485Utils now validates the socket-layer length itself (those checks used to be compiled out
+    // of release builds), which means a NULL return no longer implies "bus empty" — it can also mean
+    // "a frame arrived and was rejected". Distinguishing them keeps the info-page counters honest and
+    // keeps the drain loop going: treating a rejection as an empty bus would abandon the rest of this
+    // pass's budget and, worse, make a stream of malformed frames indistinguishable from silence
+    // during bring-up.
+    const unsigned long rejectsBefore = rs485.getRejectCount();
     const byte *data = rs485.getMsg(RS485_ADDR_ANY, &retlen);
-    if (data == nullptr) return;
+    if (data == nullptr) {
+      if (rs485.getRejectCount() != rejectsBefore) {
+        counters.rs485Rx++;                      // it did arrive; it just wasn't usable
+        counters.countError(RS485B_ERR_SHORT);
+        continue;
+      }
+      return;                                    // genuinely nothing waiting
+    }
 
     counters.rs485Rx++;
 
-    // Bounds-check the socket layer before trusting `data`/`retlen`. RS485Utils does have its own
-    // length checks, but they sit inside `#if DEBUG_LEVEL >= DEBUG_TRACE` and so are compiled out
-    // of exactly the release builds this ships as. `retlen` is the payload length the sender
-    // declared and `getLength()` is the total frame length actually received, so the three tests
-    // are: the frame is at least a socket header; the declared payload plus that header does not
-    // claim more than was received; and the payload is neither empty nor larger than the receive
-    // buffer it supposedly came out of. Only after all three does the payload become safe to read.
+    // Bounds-check the socket layer before trusting `data`/`retlen`. RS485Utils validates the first
+    // two of these itself now (its checks used to sit inside `#if DEBUG_LEVEL >= DEBUG_TRACE` and so
+    // were compiled out of exactly the release builds this ships as), which is why a rejection is
+    // handled above. Kept anyway, deliberately: it is defence in depth against a library built
+    // without the fix, and the third test is ours alone — RS485Utils has no opinion about an empty
+    // payload. `retlen` is the payload length the sender declared and `getLength()` is the total
+    // frame length actually received, so the three tests are: the frame is at least a socket header;
+    // the declared payload plus that header does not claim more than was received; and the payload is
+    // neither empty nor larger than the receive buffer it supposedly came out of.
     const uint8_t socketLen = rs485.getLength();
     if (socketLen < RS485B_SOCKET_HDR_LEN ||
         (uint16_t)retlen + RS485B_SOCKET_HDR_LEN > (uint16_t)socketLen ||
@@ -494,13 +531,18 @@ void UsermodRS485Bridge::addToJsonInfo(JsonObject &root) {
 
     const uint32_t errs = counters.errShort + counters.errStart + counters.errVersion +
                           counters.errLength + counters.errCrc + counters.errOversize;
-    if (errs || counters.unsupported || counters.txDropped || counters.udpRejected) {
+    // Partial frames abandoned by the socket's receive timeout are counted separately from framing
+    // errors, because they mean something different: a truncated or interrupted transmission rather
+    // than a corrupt one. Without surfacing this the timeout would be invisible in the field, and the
+    // bring-up runbook's soak step is written to watch it.
+    const uint16_t timeouts = rs485.getTimeoutCount();
+    if (errs || counters.unsupported || counters.txDropped || counters.udpRejected || timeouts) {
       JsonArray bad = user.createNestedArray(F("RS485 dropped"));
       bad.add(errs);
-      char buf3[64];
-      snprintf_P(buf3, sizeof(buf3), PSTR(" bad, %u unsupported, %u tx-drop, %u udp-rej"),
+      char buf3[80];
+      snprintf_P(buf3, sizeof(buf3), PSTR(" bad, %u unsupported, %u tx-drop, %u udp-rej, %u timeout"),
                  (unsigned)counters.unsupported, (unsigned)counters.txDropped,
-                 (unsigned)counters.udpRejected);
+                 (unsigned)counters.udpRejected, (unsigned)timeouts);
       bad.add(buf3);
     }
   }

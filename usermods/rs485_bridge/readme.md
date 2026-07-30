@@ -184,10 +184,12 @@ payloads) is counted and ignored; nothing is ever dereferenced past the validate
   the CRC. A **zero CRC is accepted unchecked** — stock HMTL builds have `HMTL_USE_CRC`
   commented out and transmit `crc == 0`. A non-zero CRC must match (CRC-8, poly `0xD8`, init 0,
   computed over the whole message with the CRC byte treated as zero).
-* **Socket-level bounds.** `RS485Utils`' own length checks live inside
-  `#if DEBUG_LEVEL >= DEBUG_TRACE` and are compiled out of release builds, so the usermod
-  re-checks `getLength()` against the socket header + payload length itself before touching the
-  payload.
+* **Socket-level bounds.** `RS485Utils` validates the socket-layer length itself (its checks used to
+  live inside `#if DEBUG_LEVEL >= DEBUG_TRACE` and so were compiled out of release builds); a
+  rejection is reported through `getRejectCount()` and counted here as a bad frame. The usermod still
+  re-checks `getLength()` against the socket header + payload length before touching the payload —
+  defence in depth against a library built without that fix, and the "payload must not be empty" test
+  is the usermod's own.
 * **Transmit is rate-bounded.** `RS485Socket::sendMsgTo` blocks: it calls `serial->flush()` while
   holding DE high, so a 64-byte payload at 28000 baud is ≈48 ms of busy-wait once Gammon's
   byte-stuffing is counted. The bridge therefore transmits **at most one frame per `loop()`
