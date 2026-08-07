@@ -246,6 +246,113 @@ int main() {
     CHECK(n1.lastDev == B, "higher deviceId is the agreed winner");
   }
 
+  // ---- clock durability across reboots (plan decision 5) ----
+  //
+  // Each case below is a scenario that muted a gateway under one of the rejected designs.
+
+  // The bug this decision exists to fix: sole gateway reboots, peer still latched.
+  {
+    ControlState peer = ss_ctrl_init();
+    ss_ctrl_should_apply(peer, 20, A, SELF);          // peer has seen clock 20 from gateway A
+
+    ControlState gw = ss_ctrl_init();                 // A reboots: RAM clock back to 0
+    uint32_t replies[] = { 20, 20 };
+    gw.clock = ss_ctrl_start(0, ss_ctrl_reply_consensus(replies, 2, 0));
+    CHECK(ss_ctrl_should_apply(peer, ss_ctrl_tick(gw), A, SELF),
+          "rebooted sole gateway is heard again (was 0/20 accepted before)");
+  }
+
+  // A NEW node becoming sole gateway: nothing persisted. This is the case a reservation alone
+  // cannot fix, and that (bootCount, lamport) actively breaks.
+  {
+    ControlState peer = ss_ctrl_init();
+    ss_ctrl_should_apply(peer, 5000, A, SELF);
+
+    ControlState fresh = ss_ctrl_init();
+    uint32_t replies[] = { 5000, 5000 };
+    fresh.clock = ss_ctrl_start(0, ss_ctrl_reply_consensus(replies, 2, 0));   // persisted = 0
+    CHECK(ss_ctrl_should_apply(peer, ss_ctrl_tick(fresh), B, SELF),
+          "a brand-new node with nothing persisted is accepted immediately");
+  }
+
+  // A node returning after a long outage, far enough behind that the clamp would lock it out.
+  {
+    ControlState peer = ss_ctrl_init();
+    ss_ctrl_should_apply(peer, 9000000, A, SELF);     // mesh moved ~9M commands on
+
+    ControlState back = ss_ctrl_init();
+    back.clock = 20;                                   // its persisted ceiling, far behind
+    uint32_t replies[] = { 9000000, 9000000 };
+    uint32_t c = ss_ctrl_reply_consensus(replies, 2, 20);
+    CHECK(c == 9000000, "a corroborated reply is believed however far ahead it is");
+    back.clock = ss_ctrl_start(20, c);
+    CHECK(ss_ctrl_should_apply(peer, ss_ctrl_tick(back), B, SELF),
+          "a long-absent node rejoins rather than being locked out by our own clamp");
+
+    ControlState clamped = ss_ctrl_init();
+    clamped.clock = 20;
+    ss_ctrl_observe(clamped, 9000000);
+    CHECK(clamped.clock == 20,
+          "...while an UNSOLICITED frame that far ahead is still refused (clamp intact)");
+  }
+
+  // Bypassing the clamp re-opens the poison-frame DoS on this path; corroboration replaces it.
+  {
+    uint32_t liar[] = { 0xFFFFFFFFUL, 21, 22 };
+    CHECK(ss_ctrl_reply_consensus(liar, 3, 0) == 22,
+          "a lone 0xFFFFFFFF reply is discarded, the true maximum is used");
+
+    uint32_t honest[] = { 20, 21, 22 };
+    CHECK(ss_ctrl_reply_consensus(honest, 3, 0) == 22,
+          "honest spread costs nothing — we do not undershoot to the runner-up");
+
+    uint32_t alone[] = { 0xFFFFFFFFUL };
+    CHECK(ss_ctrl_reply_consensus(alone, 1, 20) == 20,
+          "with nothing to corroborate against, a single wild reply falls back to the clamp rule");
+
+    uint32_t sane_alone[] = { 900 };
+    CHECK(ss_ctrl_reply_consensus(sane_alone, 1, 20) == 900,
+          "a single plausible reply is still believed");
+  }
+
+  // No replies at all: the persisted ceiling must carry it, and must never regress.
+  {
+    CHECK(ss_ctrl_reply_consensus(0, 0, 500) == 0, "no replies yields no consensus value");
+    CHECK(ss_ctrl_start(500, 0) == 500, "persisted ceiling is used when nobody answers");
+    CHECK(ss_ctrl_start(500, 40) == 500, "and never regresses below it");
+  }
+
+  // The reservation itself.
+  {
+    CHECK(ss_ctrl_next_ceiling(0) == SS_CTRL_RESERVE, "first boot claims one block");
+    CHECK(ss_ctrl_next_ceiling(1000) == 2000, "each claim advances by one block");
+    CHECK(ss_ctrl_next_ceiling(0xFFFFFFFFUL - 10) == 0xFFFFFFFFUL,
+          "saturates instead of wrapping — a wrapped clock is the mute we are preventing");
+    CHECK(!ss_ctrl_needs_reserve(999, 1000), "inside the block, no flash write");
+    CHECK(ss_ctrl_needs_reserve(1000, 1000), "at the ceiling, claim before publishing");
+  }
+
+  // Adoption only ever raises.
+  {
+    ControlState st = ss_ctrl_init();
+    st.clock = 500;
+    ss_ctrl_adopt(st, 400);
+    CHECK(st.clock == 500, "a lower reply never drags the clock backwards");
+    ss_ctrl_adopt(st, 600);
+    CHECK(st.clock == 600, "a higher reply raises it");
+
+    // The whole point of adopt() existing separately from observe(): same input, and the
+    // solicited path must follow it while the unsolicited path must not. Without this, adopt()
+    // could be quietly reimplemented as observe() and every test above would still pass.
+    const uint32_t far = 600 + SS_CTRL_MAX_JUMP + 1;
+    ControlState solicited = ss_ctrl_init();   solicited.clock = 600;
+    ControlState unsolicited = ss_ctrl_init(); unsolicited.clock = 600;
+    ss_ctrl_adopt(solicited, far);
+    ss_ctrl_observe(unsolicited, far);
+    CHECK(solicited.clock == far, "adopt() follows a jump beyond the clamp (solicited reply)");
+    CHECK(unsolicited.clock == 600, "observe() still refuses the identical jump (unsolicited)");
+  }
+
   printf(g_fail ? "SOME TESTS FAILED\n" : "ALL TESTS PASSED\n");
   return g_fail;
 }

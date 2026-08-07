@@ -36,6 +36,11 @@
 #define SENSOR_SYNC_MSG_ATTACH_ACK 4   // router accepting an attach, granting a membership lease
 #define SENSOR_SYNC_MSG_CONTROL    5   // a UI/preset command from a gateway node (multi-hop)
 #define SENSOR_SYNC_MSG_TIMEBASE   6   // reserved: periodic timebase beacon (unimplemented)
+#define SENSOR_SYNC_MSG_CTRL_QUERY 7   // rebooted node asking peers for the control clock
+#define SENSOR_SYNC_MSG_CTRL_CLOCK 8   // reply to CTRL_QUERY: a clock value ONLY, never
+                                       // the command itself — replaying the command would
+                                       // resurrect exactly the stale state that the
+                                       // never-re-broadcast roaming invariant prevents
 
 // Multi-hop relay. TTL bounds flood diameter; per-origin seq dedup terminates loops. The
 // origin stamps SS_DEFAULT_TTL; each relay re-broadcasts with ttl-1 and drops once ttl would reach 0.

@@ -63,6 +63,78 @@ static inline void ss_ctrl_observe(ControlState &st, uint32_t heardClock) {
   st.clock = heardClock;
 }
 
+// ---- clock durability across reboots (plan decision 5, Adam 2026-08-07) ---------------------
+//
+// The clock used to be RAM-only, so a rebooted gateway restarted at 1 and — because control frames
+// are deliberately never re-broadcast — had nothing to hear and stayed permanently muted whenever
+// it was the only source of commands. Two mechanisms together, because neither alone is enough:
+//
+//   persisted reservation   handles "I have been here before"     — but not a NEW node (nothing
+//                                                                   persisted), nor one that fell
+//                                                                   far behind while away
+//   solicited query reply   handles "tell me where the mesh is"   — but assumes clock 1 when the
+//                                                                   reply is lost or nobody answers
+//
+//   resume at  max(persisted_ceiling, consensus_of_replies)
+//
+// tick() pre-increments, so the first command published is that value + 1.
+#define SS_CTRL_RESERVE  1000UL   // clock values claimed per NVS write
+
+// Adopt a clock learned from a reply to a query WE issued, inside the window we opened for it.
+// Deliberately bypasses SS_CTRL_MAX_JUMP. That clamp exists for UNSOLICITED frames from anyone;
+// applying it here would defeat the case this whole mechanism exists for, because a node more than
+// ~1M commands behind would refuse to believe the mesh and stay locked out by our own anti-DoS
+// rule — ~14 years at tap rates, but ~29 hours at 10 commands/sec, so a node off for a long
+// weekend would never rejoin. The corroboration rule below is what replaces the clamp's protection.
+static inline void ss_ctrl_adopt(ControlState &st, uint32_t clock) {
+  if (clock > st.clock) st.clock = clock;
+}
+
+// Decide which reply to believe. Bypassing the clamp re-opens the poison-frame DoS on this path —
+// one reply of 0xFFFFFFFF would set our clock to the maximum, and the next tick wraps to 0 and
+// wedges the installation, which is the exact bug the clamp was added for. So corroboration
+// replaces the clamp: with two or more replies a lone outlier more than SS_CTRL_MAX_JUMP above the
+// runner-up is discarded and the true maximum is used, so a single liar cannot move us and honest
+// spread (peers differing by a command or two because of packet loss) costs us nothing.
+//
+// With exactly ONE reply there is nothing to corroborate against, so we fall back to the
+// unsolicited rule and refuse a jump beyond the clamp. That trades the long-absent-node recovery
+// away in single-peer meshes only; with two or more peers answering, recovery is unbounded.
+static inline uint32_t ss_ctrl_reply_consensus(const uint32_t *replies, int n, uint32_t persisted) {
+  if (replies == 0 || n <= 0) return 0;
+  uint32_t hi = 0, second = 0;
+  for (int i = 0; i < n; i++) {
+    uint32_t v = replies[i];
+    if (v > hi)          { second = hi; hi = v; }
+    else if (v > second) { second = v; }
+  }
+  if (n == 1) {
+    if (hi > persisted && hi - persisted > SS_CTRL_MAX_JUMP) return persisted;
+    return hi;
+  }
+  if (hi - second > SS_CTRL_MAX_JUMP) return second;   // lone outlier: discard it
+  return hi;
+}
+
+// The clock to resume at after a reboot.
+static inline uint32_t ss_ctrl_start(uint32_t persistedCeiling, uint32_t consensus) {
+  return persistedCeiling > consensus ? persistedCeiling : consensus;
+}
+
+// The ceiling to persist when claiming the next block. Saturates rather than wrapping: wrapping
+// would put the clock back near 0 and mute this node against every peer, which is the failure this
+// file exists to prevent.
+static inline uint32_t ss_ctrl_next_ceiling(uint32_t clock) {
+  if (clock > 0xFFFFFFFFUL - SS_CTRL_RESERVE) return 0xFFFFFFFFUL;
+  return clock + SS_CTRL_RESERVE;
+}
+
+// Must we claim another block before publishing? Checked before tick(), not after, so the clock
+// never advances past a ceiling that was actually written to flash.
+static inline bool ss_ctrl_needs_reserve(uint32_t clock, uint32_t ceiling) {
+  return clock >= ceiling;
+}
+
 // Record a command this node originated. The originator MUST do this: it is competing in the same
 // total order as everyone else, and skipping it leaves `have` false so the next stale command to
 // arrive is accepted here while every peer correctly rejects it — a divergence that persists.
