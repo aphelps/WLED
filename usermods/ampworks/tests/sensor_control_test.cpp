@@ -353,6 +353,40 @@ int main() {
     CHECK(unsolicited.clock == 600, "observe() still refuses the identical jump (unsolicited)");
   }
 
+  // ---- query / reply frame parsing ----
+  {
+    uint8_t pkt[sizeof(SensorSyncHeader) + sizeof(SensorControlClock)];
+    SensorSyncHeader h{}; SensorControlClock cl{};
+    h.magic[0]='A'; h.magic[1]='M'; h.magic[2]='P'; h.magic[3]='S';
+    h.version = SENSOR_SYNC_VERSION; h.deviceId = A;
+
+    // A CTRL_CLOCK reply must not be readable as a command, and vice versa: the whole point of
+    // splitting the parsers is that a clock can never reach the apply path.
+    h.msgType = SENSOR_SYNC_MSG_CTRL_CLOCK; h.dataLen = sizeof(cl); cl.clock = 4242;
+    memcpy(pkt, &h, sizeof(h)); memcpy(pkt + sizeof(h), &cl, sizeof(cl));
+
+    SensorSyncHeader oh; SensorControlClock oc; SensorControl bogus;
+    CHECK(ss_parse_ctrl_clock(pkt, sizeof(pkt), SELF, oh, oc), "a well-formed reply parses");
+    CHECK(oc.clock == 4242, "the clock survives the round trip");
+    CHECK(!ss_parse_control(pkt, sizeof(pkt), SELF, oh, bogus),
+          "a CTRL_CLOCK reply is NOT accepted as a command");
+    CHECK(!ss_parse_ctrl_query(pkt, sizeof(pkt), SELF, oh), "nor as a query");
+
+    CHECK(!ss_parse_ctrl_clock(pkt, sizeof(SensorSyncHeader) + 1, SELF, oh, oc),
+          "a truncated reply is rejected");
+    h.deviceId = SELF; memcpy(pkt, &h, sizeof(h));
+    CHECK(!ss_parse_ctrl_clock(pkt, sizeof(pkt), SELF, oh, oc), "our own reply is ignored");
+
+    h.deviceId = A; h.msgType = SENSOR_SYNC_MSG_CTRL_QUERY; h.dataLen = 0;
+    memcpy(pkt, &h, sizeof(h));
+    CHECK(ss_parse_ctrl_query(pkt, sizeof(SensorSyncHeader), SELF, oh), "a query parses");
+    CHECK(!ss_parse_control(pkt, sizeof(SensorSyncHeader), SELF, oh, bogus),
+          "a query is not a command either");
+    h.deviceId = SELF; memcpy(pkt, &h, sizeof(h));
+    CHECK(!ss_parse_ctrl_query(pkt, sizeof(SensorSyncHeader), SELF, oh),
+          "we never answer our own query");
+  }
+
   printf(g_fail ? "SOME TESTS FAILED\n" : "ALL TESTS PASSED\n");
   return g_fail;
 }

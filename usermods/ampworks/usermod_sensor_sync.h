@@ -182,6 +182,25 @@ class UsermodSensorSync : public Usermod {
   // Last control command applied, for the total order + echo suppression (sensor_control.h).
   ControlState control = ss_ctrl_init();
 
+  // --- control-clock durability (plan decision 5) ---
+  // `clockCeiling` is the highest clock value already committed to NVS. The clock advances freely
+  // in RAM below it; crossing it costs one flash write. `clockReady` gates publishing: until the
+  // query window closes we do not know where the mesh is, and publishing a low clock would simply
+  // be rejected by every peer and burn the user's tap.
+  static const uint8_t  SS_CTRL_MAX_REPLIES   = 8;
+  static const uint16_t SS_CTRL_QUERY_WINDOW_MS = 1500;
+  uint32_t clockCeiling  = 0;
+  bool     clockReady    = false;
+  uint32_t queryDeadline = 0;
+  uint32_t clockReplies[SS_CTRL_MAX_REPLIES];
+  uint8_t  clockReplyCount = 0;
+
+  uint32_t loadCeiling();
+  void     storeCeiling(uint32_t v);
+  void     beginClockQuery();
+  void     finishClockQuery();
+  bool     reserveClockBlock();
+
   static uint32_t deriveDeviceId();
   // msgType is explicit so control frames draw from the SAME txSeq counter as snapshots:
   // the router deduplicates per origin on a single seq space, so a separate counter would

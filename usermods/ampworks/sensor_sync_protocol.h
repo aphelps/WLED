@@ -128,6 +128,14 @@ struct __attribute__((packed)) SensorSample {
 
 #define SS_HOP_UNREACHABLE 255   // hopCost meaning "this router has no path to the leader"
 
+// Payload of SENSOR_SYNC_MSG_CTRL_CLOCK — the reply to a CTRL_QUERY. Deliberately carries the
+// clock and NOTHING else: including the command would replay state the user has already moved on
+// from, which is precisely what the never-re-broadcast roaming invariant exists to prevent.
+// CTRL_QUERY itself has no payload; the asker's id is the header deviceId.
+struct SensorControlClock {
+  uint32_t clock;
+};
+
 // Payload of SENSOR_SYNC_MSG_ROUTER_ADV. The advertising router's own id is the header deviceId.
 struct __attribute__((packed)) RouterAdvert {
   uint32_t leaderId;    // timebase leader this router routes toward (0 = none known yet)

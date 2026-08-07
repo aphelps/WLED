@@ -1,4 +1,9 @@
 #include "usermod_sensor_sync.h"
+#ifdef ARDUINO_ARCH_ESP32
+  #include <Preferences.h>          // NVS-backed control-clock ceiling (plan decision 5)
+  static const char *SS_NVS_NS  = "ampsync";
+  static const char *SS_NVS_KEY = "ctrlceil";
+#endif
 #ifdef USERMOD_MPR121
   #include "../usermods/mpr121/usermod_mpr121.h"
 #endif
@@ -94,9 +99,17 @@ void UsermodSensorSync::loop() {
   if (!started) {
     if (!transport->begin(port)) return;
     started = true;
+    // Ask where the mesh's clock is. Done here rather than in setup() because it needs the
+    // transport up, and repeated on every re-attach: connected() clears `started`, and a node that
+    // dropped out may have missed enough commands to be behind on its return.
+    beginClockQuery();
   }
 
+  // Poll BEFORE closing the window so replies that arrived during it are counted; a window that
+  // expires in the same pass that would have read its replies is a window of zero length.
   receiveLoop();
+  if (!clockReady && (int32_t)(millis() - queryDeadline) >= 0) finishClockQuery();
+
   publishPendingControl();
   broadcastLocalState();
   sweepPeers();
@@ -132,7 +145,10 @@ bool UsermodSensorSync::sendMessage(uint8_t msgType, uint8_t sensorType, const u
   h.flags      = 0;
   h.timestamp  = millis() + strip.timebase;
   memcpy(buf, &h, sizeof(h));
-  memcpy(buf + sizeof(h), data, dataLen);
+  // Guarded: CTRL_QUERY has no payload and passes (nullptr, 0). memcpy with a null source is
+  // undefined behaviour even for a zero length — it happens to work, and sanitizers rightly
+  // complain. A payload-free message type is legitimate, so the guard belongs here.
+  if (dataLen) memcpy(buf + sizeof(h), data, dataLen);
   if (!transport->broadcast(buf, sizeof(h) + dataLen)) { txSeq--; return false; }  // unwind seq on fail
   txCount++;
   return true;
@@ -168,8 +184,75 @@ bool UsermodSensorSync::publishSample(uint8_t sensorType, uint8_t channel, int16
 // snapshots get for reliability: a re-sent old command would be indistinguishable from a new one to
 // a node that had rebooted and lost its ordering state, and would resurrect state the user had
 // already moved on from.
+// --- control-clock durability (plan decision 5) -------------------------------------------------
+//
+// A reservation, not the clock itself: we persist a CEILING and spend values below it from RAM, so
+// flash sees one write per boot and per SS_CTRL_RESERVE commands rather than one per command.
+// Persisting the clock directly would tie flash lifetime to how often the user taps — fine at human
+// rates, ~73 days at 10 commands/sec, which is a trap for any later automation.
+uint32_t UsermodSensorSync::loadCeiling() {
+#ifdef ARDUINO_ARCH_ESP32
+  Preferences p;
+  if (!p.begin(SS_NVS_NS, true)) return 0;     // never written yet: a new node, ceiling 0
+  uint32_t v = p.getUInt(SS_NVS_KEY, 0);
+  p.end();
+  return v;
+#else
+  return 0;
+#endif
+}
+
+void UsermodSensorSync::storeCeiling(uint32_t v) {
+#ifdef ARDUINO_ARCH_ESP32
+  Preferences p;
+  if (!p.begin(SS_NVS_NS, false)) return;
+  p.putUInt(SS_NVS_KEY, v);
+  p.end();
+#else
+  (void)v;
+#endif
+}
+
+// Claim the next block. Called BEFORE the clock crosses the ceiling, never after, so a value is
+// only ever spent once it is backed by flash — otherwise a power cut between spending and writing
+// would let the next boot reissue clocks this node has already published.
+bool UsermodSensorSync::reserveClockBlock() {
+  uint32_t next = ss_ctrl_next_ceiling(control.clock);
+  if (next == clockCeiling) return false;      // saturated at u32 max: refuse rather than wrap
+  clockCeiling = next;
+  storeCeiling(clockCeiling);
+  return true;
+}
+
+// Ask the mesh where the clock is. Broadcast once on (re)start; replies land in receiveLoop.
+void UsermodSensorSync::beginClockQuery() {
+  clockCeiling    = loadCeiling();
+  control.clock   = clockCeiling;              // floor: never regress below what we already spent
+  clockReplyCount = 0;
+  clockReady      = false;
+  queryDeadline   = millis() + SS_CTRL_QUERY_WINDOW_MS;
+  sendMessage(SENSOR_SYNC_MSG_CTRL_QUERY, 0, nullptr, 0);
+}
+
+// Window closed: believe the replies, or fall back to what we persisted. Both inputs matter — a
+// new node has no ceiling and needs the replies; a lone node hears nothing and needs the ceiling.
+void UsermodSensorSync::finishClockQuery() {
+  uint32_t consensus = ss_ctrl_reply_consensus(clockReplies, clockReplyCount, clockCeiling);
+  control.clock = ss_ctrl_start(clockCeiling, consensus);
+  // The mesh may be far past anything we have flash-backed; re-anchor the ceiling before spending.
+  if (ss_ctrl_needs_reserve(control.clock, clockCeiling)) reserveClockBlock();
+  clockReady = true;
+}
+
 bool UsermodSensorSync::publishControl(const SensorControl &cmd) {
   if (!started) return false;
+  // Until the query window closes we do not know where the mesh's clock is. Publishing anyway
+  // would stamp a low value that every peer rejects — the user's tap would silently do nothing,
+  // which is the exact symptom this mechanism exists to remove.
+  if (!clockReady) return false;
+  // Claim flash-backed headroom BEFORE spending the value, so a power cut can never let the next
+  // boot reissue a clock this node already published.
+  if (ss_ctrl_needs_reserve(control.clock + 1, clockCeiling) && !reserveClockBlock()) return false;
   SensorControl c = cmd;
   c.lamport = ss_ctrl_tick(control);      // our command competes in the same total order as any other
 
@@ -297,6 +380,27 @@ void UsermodSensorSync::receiveLoop() {
       SensorSyncHeader ch;
       SensorControl    cc;
       if (ss_parse_control(buf, rd, deviceId, ch, cc)) { applyControl(ch, cc); continue; }
+
+      // A peer asking where the clock is. Any node can answer, not just gateways: ss_ctrl_observe
+      // keeps `control.clock` current on every command a node hears, including ones it rejected,
+      // so a pure listener holds the same value a publisher does. That is what makes recovery work
+      // in the single-gateway topology, where the only node that publishes is the one asking.
+      SensorControlClock qc;
+      if (ss_parse_ctrl_query(buf, rd, deviceId, ch)) {
+        qc.clock = control.clock;
+        sendMessage(SENSOR_SYNC_MSG_CTRL_CLOCK, 0,
+                    reinterpret_cast<const uint8_t *>(&qc), sizeof(qc));
+        continue;
+      }
+
+      // A reply to our own query. Only collected while our window is open — outside it we have
+      // already committed to a clock, and adopting late would let a stale reply move us backwards
+      // relative to commands we have since published.
+      if (ss_parse_ctrl_clock(buf, rd, deviceId, ch, qc)) {
+        if (!clockReady && clockReplyCount < SS_CTRL_MAX_REPLIES)
+          clockReplies[clockReplyCount++] = qc.clock;
+        continue;
+      }
     }
     SensorSyncHeader h;
     if (!ss_parse_header(buf, rd, deviceId, h)) continue;

@@ -162,6 +162,35 @@ static inline bool ss_ctrl_should_apply(ControlState &st, uint32_t clock, uint32
   return true;
 }
 
+// Validate a CTRL_QUERY (no payload) or a CTRL_CLOCK reply. Split from ss_parse_control because
+// these carry a clock, never a command, and must never reach the apply path.
+static inline bool ss_parse_ctrl_query(const uint8_t *pkt, int len, uint32_t selfId,
+                                       SensorSyncHeader &h) {
+  if (pkt == 0 || len < (int)sizeof(SensorSyncHeader)) return false;
+  memcpy(&h, pkt, sizeof(h));
+  if (!(h.magic[0] == 'A' && h.magic[1] == 'M' && h.magic[2] == 'P' && h.magic[3] == 'S'))
+    return false;
+  if (h.version != SENSOR_SYNC_VERSION) return false;
+  if (h.msgType != SENSOR_SYNC_MSG_CTRL_QUERY) return false;
+  if (h.deviceId == selfId) return false;   // never answer our own query
+  return true;
+}
+
+static inline bool ss_parse_ctrl_clock(const uint8_t *pkt, int len, uint32_t selfId,
+                                       SensorSyncHeader &h, SensorControlClock &out) {
+  if (pkt == 0 || len < (int)sizeof(SensorSyncHeader)) return false;
+  memcpy(&h, pkt, sizeof(h));
+  if (!(h.magic[0] == 'A' && h.magic[1] == 'M' && h.magic[2] == 'P' && h.magic[3] == 'S'))
+    return false;
+  if (h.version != SENSOR_SYNC_VERSION) return false;
+  if (h.msgType != SENSOR_SYNC_MSG_CTRL_CLOCK) return false;
+  if (h.deviceId == selfId) return false;
+  if ((int)sizeof(SensorSyncHeader) + (int)h.dataLen > len) return false;
+  if (h.dataLen < (int)sizeof(SensorControlClock)) return false;
+  memcpy(&out, pkt + sizeof(SensorSyncHeader), sizeof(out));
+  return true;
+}
+
 // Validate a control datagram and extract both header and payload. Mirrors ss_parse_header's
 // checks but gates on msgType CONTROL; ss_parse_header itself is deliberately left alone, since
 // widening it would loosen the sensor RX path to admit frames it has no handler for.
