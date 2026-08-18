@@ -39,8 +39,9 @@ SensorSyncHeader (20B): magic "AMPS" | version | msgType | sensorType | dataLen
 ```
 
 `msgType` is `SENSOR_SYNC_MSG_SNAPSHOT` (0) for sensor data and `SENSOR_SYNC_MSG_CONTROL` (5) for a
-UI/preset command; **those two travel multi-hop**. Numbers 1-4 are the router's own single-hop
-plane — `SENSOR_SYNC_MSG_BEACON` (1) leader election, `SENSOR_SYNC_MSG_ROUTER_ADV` (2) a router's
+UI/preset command; **those two travel multi-hop**, as do the clock-recovery pair
+`SENSOR_SYNC_MSG_CTRL_QUERY` (7) / `SENSOR_SYNC_MSG_CTRL_CLOCK` (8) (see **Clock recovery across
+reboots** below). Numbers 1-4 are the router's own single-hop plane — `SENSOR_SYNC_MSG_BEACON` (1) leader election, `SENSOR_SYNC_MSG_ROUTER_ADV` (2) a router's
 routing metric, `SENSOR_SYNC_MSG_ATTACH` (3) / `SENSOR_SYNC_MSG_ATTACH_ACK` (4) the attach
 handshake — and are consumed by whoever hears them. `SENSOR_SYNC_MSG_TIMEBASE` (6) is reserved and
 not yet implemented.
