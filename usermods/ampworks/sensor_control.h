@@ -42,7 +42,12 @@ static inline ControlState ss_ctrl_init() {
 }
 
 // Stamp an outgoing command: bump our clock and return the value to put on the wire.
+// Saturates at u32 max rather than wrapping: a wrap puts the clock back near 0 and mutes this
+// node against every peer (the ceiling already saturates for the same reason). Reaching the top
+// honestly takes ~4e9 commands; a node driven there by an adopted maximum stays parked at max —
+// its commands tie rather than win — instead of wedging the whole installation.
 static inline uint32_t ss_ctrl_tick(ControlState &st) {
+  if (st.clock == 0xFFFFFFFFUL) return st.clock;
   return ++st.clock;
 }
 
@@ -90,25 +95,53 @@ static inline void ss_ctrl_adopt(ControlState &st, uint32_t clock) {
   if (clock > st.clock) st.clock = clock;
 }
 
+// A reply as collected: the claimed clock plus the header deviceId it arrived under.
+// The deviceId is what corroboration counts — see below.
+struct SsCtrlReply {
+  uint32_t clock;
+  uint32_t deviceId;
+};
+
 // Decide which reply to believe. Bypassing the clamp re-opens the poison-frame DoS on this path —
-// one reply of 0xFFFFFFFF would set our clock to the maximum, and the next tick wraps to 0 and
-// wedges the installation, which is the exact bug the clamp was added for. So corroboration
-// replaces the clamp: with two or more replies a lone outlier more than SS_CTRL_MAX_JUMP above the
-// runner-up is discarded and the true maximum is used, so a single liar cannot move us and honest
-// spread (peers differing by a command or two because of packet loss) costs us nothing.
+// one reply of 0xFFFFFFFF would set our clock to the maximum and park it there, which is the
+// exact bug the clamp was added for. So corroboration replaces the clamp: with two or more
+// DISTINCT senders a lone outlier more than SS_CTRL_MAX_JUMP above the runner-up is discarded and
+// the true maximum is used, so a single liar cannot move us and honest spread (peers differing by
+// a command or two because of packet loss) costs us nothing.
 //
-// With exactly ONE reply there is nothing to corroborate against, so we fall back to the
-// unsolicited rule and refuse a jump beyond the clamp. That trades the long-absent-node recovery
-// away in single-peer meshes only; with two or more peers answering, recovery is unbounded.
-static inline uint32_t ss_ctrl_reply_consensus(const uint32_t *replies, int n, uint32_t persisted) {
+// Corroboration counts SENDERS, not frames: the CTRL_QUERY broadcast announces on-air that the
+// reply window just opened, so one liar answering twice with two nearby values must remain ONE
+// voice — replies are deduped by deviceId first, keeping each sender's highest claim. The header
+// deviceId is spoofable on this unauthenticated channel, so this is not a defence against a
+// deliberate multi-identity attacker (only auth would be); it restores the stated guarantee
+// against the realistic threat, a single buggy or half-upgraded sender.
+//
+// With exactly ONE distinct sender there is nothing to corroborate against, so we fall back to
+// the unsolicited rule and refuse a jump beyond the clamp. That trades the long-absent-node
+// recovery away in single-peer meshes only; with two or more peers answering, recovery is
+// unbounded.
+static inline uint32_t ss_ctrl_reply_consensus(const SsCtrlReply *replies, int n,
+                                               uint32_t persisted) {
   if (replies == 0 || n <= 0) return 0;
+  // Dedup by sender, keeping each sender's highest claim. n is small (reply buffer is 8).
+  uint32_t voice[16]; uint32_t voiceDev[16]; int voices = 0;
+  for (int i = 0; i < n && voices < 16; i++) {
+    int j = 0;
+    for (; j < voices; j++) {
+      if (voiceDev[j] == replies[i].deviceId) {
+        if (replies[i].clock > voice[j]) voice[j] = replies[i].clock;
+        break;
+      }
+    }
+    if (j == voices) { voiceDev[voices] = replies[i].deviceId; voice[voices++] = replies[i].clock; }
+  }
   uint32_t hi = 0, second = 0;
-  for (int i = 0; i < n; i++) {
-    uint32_t v = replies[i];
+  for (int i = 0; i < voices; i++) {
+    uint32_t v = voice[i];
     if (v > hi)          { second = hi; hi = v; }
     else if (v > second) { second = v; }
   }
-  if (n == 1) {
+  if (voices == 1) {
     if (hi > persisted && hi - persisted > SS_CTRL_MAX_JUMP) return persisted;
     return hi;
   }

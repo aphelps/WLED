@@ -29,7 +29,7 @@ static int build_ctrl(uint8_t *buf, uint32_t dev, uint16_t seq, uint32_t lamport
 }
 
 int main() {
-  const uint32_t SELF = 0x11111111, A = 0x22222222, B = 0x33333333;
+  const uint32_t SELF = 0x11111111, A = 0x22222222, B = 0x33333333, C = 0x44444444;
   uint8_t pkt[128];
 
   // ---- wire size: the whole point of the compact-command decision ----
@@ -256,7 +256,7 @@ int main() {
     ss_ctrl_should_apply(peer, 20, A, SELF);          // peer has seen clock 20 from gateway A
 
     ControlState gw = ss_ctrl_init();                 // A reboots: RAM clock back to 0
-    uint32_t replies[] = { 20, 20 };
+    SsCtrlReply replies[] = { {20, B}, {20, C} };
     gw.clock = ss_ctrl_start(0, ss_ctrl_reply_consensus(replies, 2, 0));
     CHECK(ss_ctrl_should_apply(peer, ss_ctrl_tick(gw), A, SELF),
           "rebooted sole gateway is heard again (was 0/20 accepted before)");
@@ -269,7 +269,7 @@ int main() {
     ss_ctrl_should_apply(peer, 5000, A, SELF);
 
     ControlState fresh = ss_ctrl_init();
-    uint32_t replies[] = { 5000, 5000 };
+    SsCtrlReply replies[] = { {5000, A}, {5000, C} };
     fresh.clock = ss_ctrl_start(0, ss_ctrl_reply_consensus(replies, 2, 0));   // persisted = 0
     CHECK(ss_ctrl_should_apply(peer, ss_ctrl_tick(fresh), B, SELF),
           "a brand-new node with nothing persisted is accepted immediately");
@@ -282,7 +282,7 @@ int main() {
 
     ControlState back = ss_ctrl_init();
     back.clock = 20;                                   // its persisted ceiling, far behind
-    uint32_t replies[] = { 9000000, 9000000 };
+    SsCtrlReply replies[] = { {9000000, A}, {9000000, C} };
     uint32_t c = ss_ctrl_reply_consensus(replies, 2, 20);
     CHECK(c == 9000000, "a corroborated reply is believed however far ahead it is");
     back.clock = ss_ctrl_start(20, c);
@@ -298,26 +298,64 @@ int main() {
 
   // Bypassing the clamp re-opens the poison-frame DoS on this path; corroboration replaces it.
   {
-    uint32_t liar[] = { 0xFFFFFFFFUL, 21, 22 };
+    SsCtrlReply liar[] = { {0xFFFFFFFFUL, A}, {21, B}, {22, C} };
     CHECK(ss_ctrl_reply_consensus(liar, 3, 0) == 22,
           "a lone 0xFFFFFFFF reply is discarded, the true maximum is used");
 
-    uint32_t honest[] = { 20, 21, 22 };
+    SsCtrlReply honest[] = { {20, A}, {21, B}, {22, C} };
     CHECK(ss_ctrl_reply_consensus(honest, 3, 0) == 22,
           "honest spread costs nothing — we do not undershoot to the runner-up");
 
-    uint32_t alone[] = { 0xFFFFFFFFUL };
+    SsCtrlReply alone[] = { {0xFFFFFFFFUL, A} };
     CHECK(ss_ctrl_reply_consensus(alone, 1, 20) == 20,
           "with nothing to corroborate against, a single wild reply falls back to the clamp rule");
 
-    uint32_t sane_alone[] = { 900 };
+    SsCtrlReply sane_alone[] = { {900, A} };
     CHECK(ss_ctrl_reply_consensus(sane_alone, 1, 20) == 900,
           "a single plausible reply is still believed");
+
+    // NEW-A: corroboration counts SENDERS, not frames. The query broadcast announces the reply
+    // window on-air, so one liar answering twice with two nearby maxima is still ONE voice and
+    // falls back to the single-sender clamp rule.
+    SsCtrlReply twice[] = { {0xFFFFFFFFUL, A}, {0xFFFFFFFEUL, A} };
+    CHECK(ss_ctrl_reply_consensus(twice, 2, 20) == 20,
+          "one sender answering twice cannot corroborate itself past the clamp");
+    SsCtrlReply twice_sane[] = { {900, A}, {880, A} };
+    CHECK(ss_ctrl_reply_consensus(twice_sane, 2, 20) == 900,
+          "...but a repeated plausible sender still counts as one believable voice");
+    SsCtrlReply mixed[] = { {0xFFFFFFFFUL, A}, {0xFFFFFFFEUL, A}, {30, B} };
+    CHECK(ss_ctrl_reply_consensus(mixed, 3, 20) == 30,
+          "a double-voting liar plus one honest peer: the liar is a lone outlier, honesty wins");
   }
 
   // No replies at all: the persisted ceiling must carry it, and must never regress.
   {
     CHECK(ss_ctrl_reply_consensus(0, 0, 500) == 0, "no replies yields no consensus value");
+    // NEW-B: raise-only re-attach. Observation legitimately carries the clock past the ceiling;
+    // a re-run of the query path (WiFi re-attach) must adopt, never assign, or a window that
+    // closes with zero replies regresses the clock and re-mutes the node.
+    {
+      ControlState peer = ss_ctrl_init();
+      ControlState node = ss_ctrl_init();
+      node.clock = 1000;                       // resumed at its ceiling
+      ss_ctrl_observe(node, 5000);             // then heard the mesh move on
+      CHECK(node.clock == 5000, "observation raised the clock past the ceiling");
+      ss_ctrl_should_apply(peer, 5000, A, SELF);   // a peer is latched at 5000
+
+      // Re-attach: begin (floor to ceiling) + finish (zero replies -> consensus 0).
+      ss_ctrl_adopt(node, 1000);                       // begin: raise-only floor
+      ss_ctrl_adopt(node, ss_ctrl_start(1000, 0));     // finish: adopt, never assign
+      CHECK(node.clock == 5000, "the re-attach did not regress what observation learned");
+      CHECK(ss_ctrl_should_apply(peer, ss_ctrl_tick(node), B, SELF),
+            "the latched peer accepts the node's next command after the re-attach");
+    }
+    // Saturating tick: the top of the clock parks rather than wrapping to 0.
+    {
+      ControlState st = ss_ctrl_init();
+      st.clock = 0xFFFFFFFFUL;
+      CHECK(ss_ctrl_tick(st) == 0xFFFFFFFFUL, "tick saturates at u32 max");
+      CHECK(st.clock == 0xFFFFFFFFUL, "...and the stored clock does not wrap to 0");
+    }
     CHECK(ss_ctrl_start(500, 0) == 500, "persisted ceiling is used when nobody answers");
     CHECK(ss_ctrl_start(500, 40) == 500, "and never regresses below it");
   }

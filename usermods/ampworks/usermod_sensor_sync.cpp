@@ -227,7 +227,10 @@ bool UsermodSensorSync::reserveClockBlock() {
 // Ask the mesh where the clock is. Broadcast once on (re)start; replies land in receiveLoop.
 void UsermodSensorSync::beginClockQuery() {
   clockCeiling    = loadCeiling();
-  control.clock   = clockCeiling;              // floor: never regress below what we already spent
+  // Raise-only, never assign: a WiFi re-attach re-runs this, and observation may have already
+  // carried the clock far past the ceiling. Overwriting would regress it and re-mute the node —
+  // the exact symptom this mechanism removes.
+  ss_ctrl_adopt(control, clockCeiling);        // floor: never regress below what we already spent
   clockReplyCount = 0;
   clockReady      = false;
   queryDeadline   = millis() + SS_CTRL_QUERY_WINDOW_MS;
@@ -238,7 +241,9 @@ void UsermodSensorSync::beginClockQuery() {
 // new node has no ceiling and needs the replies; a lone node hears nothing and needs the ceiling.
 void UsermodSensorSync::finishClockQuery() {
   uint32_t consensus = ss_ctrl_reply_consensus(clockReplies, clockReplyCount, clockCeiling);
-  control.clock = ss_ctrl_start(clockCeiling, consensus);
+  // Adopt (raise-only), never assign: anything observed DURING the window is already ours and
+  // must survive a window that closes with zero or losing replies.
+  ss_ctrl_adopt(control, ss_ctrl_start(clockCeiling, consensus));
   // The mesh may be far past anything we have flash-backed; re-anchor the ceiling before spending.
   if (ss_ctrl_needs_reserve(control.clock, clockCeiling)) reserveClockBlock();
   clockReady = true;
@@ -355,7 +360,10 @@ void UsermodSensorSync::onStateChange(uint8_t mode) {
 // Runs on the loop() task. Reads the state as it now stands, which is also why coalescing is
 // correct — whatever the final state of a burst of changes is, that is what the mesh should get.
 void UsermodSensorSync::publishPendingControl() {
-  if (!controlPending) return;
+  // The clockReady gate is known-temporary (a query window is ~1.5s), so a tap landing inside it
+  // stays pending instead of being consumed against a publish that refuses — state is read at
+  // publish time, so deferred taps coalesce for free.
+  if (!controlPending || !clockReady) return;
   controlPending = false;
 
   Segment &seg = strip.getMainSegment();
@@ -398,7 +406,7 @@ void UsermodSensorSync::receiveLoop() {
       // relative to commands we have since published.
       if (ss_parse_ctrl_clock(buf, rd, deviceId, ch, qc)) {
         if (!clockReady && clockReplyCount < SS_CTRL_MAX_REPLIES)
-          clockReplies[clockReplyCount++] = qc.clock;
+          clockReplies[clockReplyCount++] = SsCtrlReply{ qc.clock, ch.deviceId };
         continue;
       }
     }

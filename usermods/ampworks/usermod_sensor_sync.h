@@ -192,7 +192,7 @@ class UsermodSensorSync : public Usermod {
   uint32_t clockCeiling  = 0;
   bool     clockReady    = false;
   uint32_t queryDeadline = 0;
-  uint32_t clockReplies[SS_CTRL_MAX_REPLIES];
+  SsCtrlReply clockReplies[SS_CTRL_MAX_REPLIES];
   uint8_t  clockReplyCount = 0;
 
   uint32_t loadCeiling();
