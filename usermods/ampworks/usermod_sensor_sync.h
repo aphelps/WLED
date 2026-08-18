@@ -32,7 +32,9 @@
  *   uint8_t n = ss->drain(cur, ev, 8);                    // each frame; advances cur
  *
  * Config (cfg.json): enabled (default true), port (default 21330), id (device-id override;
- * 0 = auto from MAC), keyframeMs (periodic full-snapshot re-broadcast; 0 = off).
+ * 0 = auto from MAC), keyframeMs (periodic full-snapshot re-broadcast; 0 = off),
+ * gateway (default false; publish local user-driven state changes onto the mesh via the
+ * onStateChange hook), useEspNow (default false = UDP).
  */
 
 // Minimal transport seam: broadcast one datagram, or poll the next received one. Transport-specific

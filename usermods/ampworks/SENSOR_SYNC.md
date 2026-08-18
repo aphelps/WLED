@@ -225,6 +225,19 @@ what it applied. The router's per-origin dedup stops a frame circulating the bac
 stops an *edge* re-originating what it applied under its own `deviceId`, which would defeat that
 dedup entirely — so the edge declines both.
 
+**Turning it on.** Publishing is opt-in per node: set `gateway: true` in the usermod's cfg.json
+block (default false). A gateway node originates a `CONTROL` frame from the `onStateChange` hook
+when a local user-driven change lands; non-gateway nodes only ever apply what they hear.
+
+**Clock recovery across reboots.** Two dedicated frames, `SENSOR_SYNC_MSG_CTRL_QUERY` (7) and
+`SENSOR_SYNC_MSG_CTRL_CLOCK` (8), let a (re)starting node ask where the mesh's Lamport clock is:
+it broadcasts a QUERY on start, peers answer with a CLOCK reply carrying their clock value only
+(never a command), and the querier adopts `max(persisted ceiling, corroborated replies)` when its
+~1.5 s window closes. Replies are corroborated per **sender**: one repeated sender is a single
+voice, and with only one voice an implausible jump falls back to the unsolicited clamp rule.
+Both frames are on the router relay whitelist so recovery crosses the backbone. Neither ever
+reaches the apply path.
+
 **Roaming.** Moving a phone to another node keeps working, and nothing reverts: control state is
 broadcast **only** on an explicit local command. No node announces its own idea of the state on
 connect, so a newly-arrived gateway cannot undo something newer. This holds by construction rather
