@@ -425,6 +425,131 @@ int main() {
           "we never answer our own query");
   }
 
+  // --- transmit-sequence durability across a reboot (esp-now-router#3 HIGH) -------------------
+  //
+  // The assertion is deliberately about what a ROUTER decides, expressed through ss_seq_newer —
+  // the same comparison ss_router_should_relay's dedup rule uses. Asserting that the ceiling was
+  // read back from NVS would test a value this code controls and would pass whether or not the
+  // node is ever heard again; the observable that matters is "the next frame is newer than what
+  // the router is holding".
+  {
+    // A node's whole transmit history, modelled the way the usermod does it: resume at the
+    // persisted ceiling, reserve before spending, spend one seq per frame.
+    struct TxNode {
+      uint16_t txSeq;
+      uint16_t ceiling;
+      uint16_t nvs;                 // what is actually in flash right now
+      void boot()  { ceiling = nvs; txSeq = ceiling; }
+      uint16_t send() {
+        if (ss_seq_needs_reserve(txSeq, ceiling)) { ceiling = ss_seq_next_ceiling(ceiling); nvs = ceiling; }
+        return txSeq++;
+      }
+    };
+
+    TxNode n{0, 0, 0};
+    n.boot();
+    uint16_t lastSeen = 0;          // stands in for the router's SensorRouterPeer.lastSeq
+    bool     haveSeen = false;
+    for (int i = 0; i < 5000; i++) {                 // the reproduction's frame count
+      uint16_t s = n.send();
+      CHECK(!haveSeen || ss_seq_newer(s, lastSeen), "every pre-reboot frame is fresh");
+      lastSeen = s; haveSeen = true;
+    }
+
+    // Reboot: RAM is gone, flash is not.
+    n.boot();
+    uint16_t first = n.send();
+    CHECK(ss_seq_newer(first, lastSeen),
+          "the first frame after a reboot is accepted by a router holding the pre-reboot lastSeq");
+
+    // And it keeps being accepted — the reproduction was 4999 further drops, not just the one.
+    uint16_t prev = first;
+    for (int i = 0; i < 100; i++) {
+      uint16_t s = n.send();
+      CHECK(ss_seq_newer(s, prev), "and every frame behind it too");
+      prev = s;
+    }
+
+    // The failure this replaces: a node that resumed from RAM (ceiling never consulted) restarts
+    // at 0 and is mute. If this ever passes, the fix has stopped doing anything.
+    CHECK(!ss_seq_newer(0, lastSeen), "restarting at seq 0 would indeed have been dropped");
+
+    // Reboot immediately after a block is committed but before any of it is spent: no seq may be
+    // reissued. The write happens inside send(), so this is the boundary where the ceiling is in
+    // flash and the RAM counter that would have spent it is gone.
+    TxNode b{0, 0, 0};
+    b.boot();
+    uint16_t justSpent = b.send();       // triggers the first reservation
+    b.boot();                            // power cut right after the write
+    uint16_t afterCut = b.send();
+    CHECK(ss_seq_newer(afterCut, justSpent), "a seq is never reissued across a mid-block reboot");
+  }
+
+  // --- seq reservation arithmetic, including the wrap the clock version cannot have ------------
+  {
+    CHECK(ss_seq_needs_reserve(0, 0), "a fresh node must reserve before its first frame");
+    CHECK(!ss_seq_needs_reserve(0, 1), "headroom below the ceiling needs no write");
+    CHECK(ss_seq_next_ceiling(0) == SS_SEQ_RESERVE, "a block is SS_SEQ_RESERVE wide");
+
+    // Unlike the u32 clock, this space is modular and MEANT to wrap. Near the top of the range the
+    // ceiling wraps past 0 and must still read as "ahead of us", or a node would reserve on every
+    // single frame forever right after wrapping.
+    uint16_t high = (uint16_t)(0xFFFF - 10);
+    uint16_t wrapped = ss_seq_next_ceiling(high);
+    CHECK(wrapped < high, "the ceiling wraps rather than saturating");
+    CHECK(!ss_seq_needs_reserve(high, wrapped), "a wrapped ceiling is still ahead of us");
+    CHECK(ss_seq_newer(wrapped, high), "and ss_seq_newer agrees it is ahead");
+
+    // The block must stay well under half the space: ss_seq_newer reads the midpoint as "older".
+    CHECK(SS_SEQ_RESERVE < 32768, "a block at or past the midpoint would invert ss_seq_newer");
+  }
+
+  // --- bounding the query reply fan-out (esp-now-router#3 MEDIUM) -----------------------------
+  {
+    CHECK(ss_ctrl_should_answer(10, 5),  "a peer ahead of the querier answers");
+    CHECK(!ss_ctrl_should_answer(5, 10), "a peer behind it stays silent");
+    CHECK(!ss_ctrl_should_answer(7, 7),  "a peer level with it adds nothing, so stays silent");
+
+    // The filter must never cost the querier information: whatever the maximum was, the node
+    // holding it still speaks.
+    const uint32_t asked = 100;
+    uint32_t peers[] = { 3, 99, 100, 101, 250 };
+    uint32_t bestHeard = 0; int answered = 0;
+    for (uint32_t pc : peers)
+      if (ss_ctrl_should_answer(pc, asked)) { answered++; if (pc > bestHeard) bestHeard = pc; }
+    CHECK(answered == 2, "only the peers that could change the outcome answer");
+    CHECK(bestHeard == 250, "and the true maximum is still heard");
+    CHECK(ss_ctrl_start(asked, bestHeard) == 250, "so recovery lands on the same value as before");
+
+    // Wire compatibility both ways.
+    uint8_t pkt[sizeof(SensorSyncHeader) + sizeof(SensorControlClock)];
+    SensorSyncHeader h{};
+    memcpy(h.magic, "AMPS", 4);
+    h.version = SENSOR_SYNC_VERSION; h.msgType = SENSOR_SYNC_MSG_CTRL_QUERY;
+    h.deviceId = 0xAAAA1111; h.ttl = SS_DEFAULT_TTL;
+
+    SensorSyncHeader oh; uint32_t ask = 0xDEAD;
+    h.dataLen = 0; memcpy(pkt, &h, sizeof(h));
+    CHECK(ss_parse_ctrl_query(pkt, sizeof(SensorSyncHeader), 0x1234, oh, &ask),
+          "a payload-less query from an older node still parses");
+    CHECK(ask == 0, "and reads as ask=0");
+    CHECK(ss_ctrl_should_answer(1, ask), "so every peer answers it, exactly as before");
+
+    SensorControlClock qc; qc.clock = 4242;
+    h.dataLen = sizeof(qc);
+    memcpy(pkt, &h, sizeof(h)); memcpy(pkt + sizeof(h), &qc, sizeof(qc));
+    ask = 0;
+    CHECK(ss_parse_ctrl_query(pkt, sizeof(pkt), 0x1234, oh, &ask), "a query with a clock parses");
+    CHECK(ask == 4242, "and the querier's clock is read back");
+
+    // A truncated payload must not be read as a partial clock: dataLen claims a clock the datagram
+    // does not contain. Falling back to ask=0 is the safe direction (everyone answers).
+    ask = 0xFFFF;
+    CHECK(ss_parse_ctrl_query(pkt, sizeof(SensorSyncHeader) + 1, 0x1234, oh, &ask),
+          "a truncated query still parses as a query");
+    CHECK(ask == 0, "but its clock is not believed");
+  }
+
   printf(g_fail ? "SOME TESTS FAILED\n" : "ALL TESTS PASSED\n");
   return g_fail;
 }

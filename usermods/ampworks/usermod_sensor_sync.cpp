@@ -3,6 +3,7 @@
   #include <Preferences.h>          // NVS-backed control-clock ceiling (plan decision 5)
   static const char *SS_NVS_NS  = "ampsync";
   static const char *SS_NVS_KEY = "ctrlceil";
+  static const char *SS_NVS_SEQ = "seqceil";   // tx-sequence ceiling (esp-now-router#3 HIGH)
 #endif
 #ifdef USERMOD_MPR121
   #include "../usermods/mpr121/usermod_mpr121.h"
@@ -85,6 +86,16 @@ int EspNowSensorTransport::poll(uint8_t *buf, int maxLen) {
 // ---------------------------------------------------------------------------
 void UsermodSensorSync::setup() {
   deviceId = configId ? configId : deriveDeviceId();
+  // Resume the transmit sequence AT the persisted ceiling (esp-now-router#3 HIGH). Every seq this
+  // node ever transmitted was below that ceiling when it was written, so the first frame after a
+  // reboot is strictly newer than any `lastSeq` a router can be holding for us — which is exactly
+  // what dedup rule 1 asks for, and exactly what restarting at 0 could not provide.
+  //
+  // Here and not in loop()'s (re)start path: a WiFi re-attach must NOT reload. txSeq in RAM is
+  // already ahead of the stored ceiling by however much of the block it has spent, and reloading
+  // would move it BACKWARDS onto seqs this boot already put on the wire.
+  seqCeiling = loadSeqCeiling();
+  txSeq      = seqCeiling;
   initDone = true;
 }
 
@@ -109,6 +120,17 @@ void UsermodSensorSync::loop() {
   // expires in the same pass that would have read its replies is a window of zero length.
   receiveLoop();
   if (!clockReady && (int32_t)(millis() - queryDeadline) >= 0) finishClockQuery();
+
+  // Send a jittered query reply whose delay has elapsed. Read `control.clock` HERE rather than at
+  // receive time: a command applied during the jitter makes the reply MORE correct, and the
+  // querier wants our latest value, not the one we held when its query landed.
+  if (replyPending && (int32_t)(millis() - replyDueMs) >= 0) {
+    replyPending = false;
+    SensorControlClock qc;
+    qc.clock = control.clock;
+    sendMessage(SENSOR_SYNC_MSG_CTRL_CLOCK, 0,
+                reinterpret_cast<const uint8_t *>(&qc), sizeof(qc));
+  }
 
   publishPendingControl();
   broadcastLocalState();
@@ -140,6 +162,10 @@ bool UsermodSensorSync::sendMessage(uint8_t msgType, uint8_t sensorType, const u
   h.sensorType = sensorType;
   h.dataLen    = dataLen;
   h.deviceId   = deviceId;
+  // Claim flash-backed headroom BEFORE the seq goes on the wire (esp-now-router#3 HIGH). Order is
+  // the whole point: a seq transmitted above the persisted ceiling is one the next boot would
+  // reissue, and routers would drop it and everything behind it as a duplicate.
+  if (ss_seq_needs_reserve(txSeq, seqCeiling)) reserveSeqBlock();
   h.seq        = txSeq++;
   h.ttl        = SS_DEFAULT_TTL;   // origin stamps the hop budget so routers can relay
   h.flags      = 0;
@@ -149,6 +175,9 @@ bool UsermodSensorSync::sendMessage(uint8_t msgType, uint8_t sensorType, const u
   // undefined behaviour even for a zero length — it happens to work, and sanitizers rightly
   // complain. A payload-free message type is legitimate, so the guard belongs here.
   if (dataLen) memcpy(buf + sizeof(h), data, dataLen);
+  // Unwind the seq on a failed send so an un-transmitted value is not burned. The CEILING is
+  // deliberately NOT unwound: it may already be in flash, and a ceiling that is too high only costs
+  // unused seq numbers, where one that is too low is the bug this whole mechanism removes.
   if (!transport->broadcast(buf, sizeof(h) + dataLen)) { txSeq--; return false; }  // unwind seq on fail
   txCount++;
   return true;
@@ -213,6 +242,41 @@ void UsermodSensorSync::storeCeiling(uint32_t v) {
 #endif
 }
 
+// --- transmit-sequence durability (the esp-now-router#3 HIGH) ---------------------------------
+// Same reservation shape as the clock above, and for the same reason: one flash write per
+// SS_SEQ_RESERVE frames rather than one per frame. See sensor_control.h for why a reservation beats
+// restart-detection and dedup exemptions.
+uint16_t UsermodSensorSync::loadSeqCeiling() {
+#ifdef ARDUINO_ARCH_ESP32
+  Preferences p;
+  if (!p.begin(SS_NVS_NS, true)) return 0;     // never written: a new node starts at 0, as before
+  uint16_t v = (uint16_t)p.getUShort(SS_NVS_SEQ, 0);
+  p.end();
+  return v;
+#else
+  return 0;
+#endif
+}
+
+void UsermodSensorSync::storeSeqCeiling(uint16_t v) {
+#ifdef ARDUINO_ARCH_ESP32
+  Preferences p;
+  if (!p.begin(SS_NVS_NS, false)) return;
+  p.putUShort(SS_NVS_SEQ, v);
+  p.end();
+#else
+  (void)v;
+#endif
+}
+
+// Claim the next seq block. Called BEFORE the seq is put on the wire, never after: a seq that has
+// been transmitted but whose ceiling never reached flash is precisely the RAM-only counter this
+// fix removes — the next boot would reissue it and be dropped as a duplicate all over again.
+void UsermodSensorSync::reserveSeqBlock() {
+  seqCeiling = ss_seq_next_ceiling(seqCeiling);
+  storeSeqCeiling(seqCeiling);
+}
+
 // Claim the next block. Called BEFORE the clock crosses the ceiling, never after, so a value is
 // only ever spent once it is backed by flash — otherwise a power cut between spending and writing
 // would let the next boot reissue clocks this node has already published.
@@ -234,7 +298,12 @@ void UsermodSensorSync::beginClockQuery() {
   clockReplyCount = 0;
   clockReady      = false;
   queryDeadline   = millis() + SS_CTRL_QUERY_WINDOW_MS;
-  sendMessage(SENSOR_SYNC_MSG_CTRL_QUERY, 0, nullptr, 0);
+  // Carry our own clock in the query so peers at or below it can stay silent (esp-now-router#3
+  // MEDIUM). We only ever use the maximum reply, so those peers could not have changed the outcome.
+  SensorControlClock ask;
+  ask.clock = control.clock;
+  sendMessage(SENSOR_SYNC_MSG_CTRL_QUERY, 0,
+              reinterpret_cast<const uint8_t *>(&ask), sizeof(ask));
 }
 
 // Window closed: believe the replies, or fall back to what we persisted. Both inputs matter — a
@@ -394,10 +463,24 @@ void UsermodSensorSync::receiveLoop() {
       // so a pure listener holds the same value a publisher does. That is what makes recovery work
       // in the single-gateway topology, where the only node that publishes is the one asking.
       SensorControlClock qc;
-      if (ss_parse_ctrl_query(buf, rd, deviceId, ch)) {
-        qc.clock = control.clock;
-        sendMessage(SENSOR_SYNC_MSG_CTRL_CLOCK, 0,
-                    reinterpret_cast<const uint8_t *>(&qc), sizeof(qc));
+      uint32_t asked = 0;
+      if (ss_parse_ctrl_query(buf, rd, deviceId, ch, &asked)) {
+        // Answer only if we hold something the querier does not (esp-now-router#3 MEDIUM). A peer
+        // at or below the queried clock adds nothing to a max(), so its reply is pure airtime.
+        if (!ss_ctrl_should_answer(control.clock, asked)) continue;
+        // Jitter the few replies that DO matter across the querier's window. Replies are collected
+        // for SS_CTRL_QUERY_WINDOW_MS, so anything inside SS_CTRL_REPLY_JITTER_MS is in time; firing
+        // immediately would put every survivor on air in the same instant.
+        //
+        // Mixed from deviceId rather than drawn from random(): Arduino's PRNG is unseeded, so every
+        // node runs the identical sequence from boot. The case that matters most is a whole
+        // installation powering up together after a cut — precisely when every node would draw the
+        // SAME "random" delay and collide, which is the failure jitter exists to prevent. deviceId
+        // is a MAC-derived hash, so mixing it guarantees nodes differ; millis() keeps a repeat query
+        // from landing on the same offset twice.
+        uint32_t spread = (deviceId * 2654435761u) ^ (millis() * 2246822519u);
+        replyDueMs = millis() + (spread % SS_CTRL_REPLY_JITTER_MS);
+        replyPending = true;
         continue;
       }
 

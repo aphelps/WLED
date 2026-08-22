@@ -191,11 +191,27 @@ class UsermodSensorSync : public Usermod {
   // be rejected by every peer and burn the user's tap.
   static const uint8_t  SS_CTRL_MAX_REPLIES   = 8;
   static const uint16_t SS_CTRL_QUERY_WINDOW_MS = 1500;
+  // Jitter window for a query reply. Must stay comfortably inside SS_CTRL_QUERY_WINDOW_MS or a
+  // reply the source filter judged WORTH sending would arrive after the querier stopped listening —
+  // the filter would then have cost information rather than saved airtime.
+  static const uint16_t SS_CTRL_REPLY_JITTER_MS = 400;
   uint32_t clockCeiling  = 0;
   bool     clockReady    = false;
   uint32_t queryDeadline = 0;
+  // A reply we owe a querier, held back by jitter. One slot, not a queue: a second query arriving
+  // inside the window is answered by the same single reply, and coalescing two queries into one
+  // reply is the desired behaviour, not a lost frame.
+  bool     replyPending  = false;
+  uint32_t replyDueMs    = 0;
   SsCtrlReply clockReplies[SS_CTRL_MAX_REPLIES];
   uint8_t  clockReplyCount = 0;
+
+  // Transmit-sequence durability (esp-now-router#3 HIGH). `seqCeiling` is the highest seq committed
+  // to NVS; txSeq spends below it from RAM, one flash write per SS_SEQ_RESERVE frames.
+  uint16_t seqCeiling = 0;
+  uint16_t loadSeqCeiling();
+  void     storeSeqCeiling(uint16_t v);
+  void     reserveSeqBlock();
 
   uint32_t loadCeiling();
   void     storeCeiling(uint32_t v);
