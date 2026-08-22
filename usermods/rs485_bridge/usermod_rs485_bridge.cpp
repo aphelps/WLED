@@ -113,6 +113,7 @@ void UsermodRS485Bridge::releasePins() {
 // Any failure leaves `running` false with `failReason` set, so the usermod is inert rather than
 // half-initialised and the reason shows up in /json/info.
 void UsermodRS485Bridge::setup() {
+  rs485b_pending_init(pending);   // HTTP endpoint state, before any route can fire
   initDone = true;
   if (!enabled) return;
   // UART 0 is the console/programming port — taking it over would cut off serial debugging and
@@ -187,9 +188,14 @@ void UsermodRS485Bridge::connected() {
 // bridge from ever being the cause of a visible glitch.
 void UsermodRS485Bridge::loop() {
   if (!running || strip.isUpdating()) return;
+  // Routes are registered here rather than in setup(): the bridge may not be `running` at usermod
+  // setup time (pins are allocated first), and registering a route that then 503s every caller is
+  // worse than not offering it yet.
+  registerHttpRoutes();
   serviceRs485();
   serviceTx();
   serviceUdp();
+  serviceHttpPending();
 }
 
 // Slave path, receive side: drain up to RX_PER_LOOP frames off the RS485 bus and act on them.
@@ -347,6 +353,11 @@ void UsermodRS485Bridge::handleDecision(const RS485BDecision &d, const uint8_t *
       return;
 
     case RS485B_ACT_RELAY_ONLY:
+      // A frame reaching here is either addressed elsewhere or is a RESPONSE to something we sent.
+      // Offer it to any HTTP request waiting for exactly this (source address + type) BEFORE
+      // relaying. Both happen: an unclaimed reply still reaches the UDP peer, and a claimed one
+      // does too, so adding this endpoint changes nothing for an existing UDP client.
+      completeHttpReply(sourceAddr, frame, frameLen);
       relayToPeer(frame, frameLen);
       return;
 
@@ -497,6 +508,250 @@ void UsermodRS485Bridge::relayToPeer(const uint8_t *frame, uint8_t frameLen) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// HTTP command endpoint — POST /hmtl
+// ---------------------------------------------------------------------------------------------
+// Why this exists: a one-shot UDP frame is unacknowledged and unretried, and one was observed lost
+// in a 4-frame burst during the 2026-08-19 bench validation. A dropped command is silent. HTTP
+// gives the caller a status to check and, where the frame expects an answer, the module's actual
+// reply — a confirm/retry primitive the UDP path cannot offer. The UDP path is unchanged and stays
+// the right choice for streaming or low-latency use.
+//
+// Route shape follows the in-tree precedent (multi_relay registers /relays), NOT WLED's /json
+// namespace, which has its own schema this would collide with.
+//
+// Body: {"frame":"<hex or base64>"[,"encoding":"hex"|"base64"]}. Encoding is auto-detected when
+// omitted. There is deliberately no structured command JSON — that would be a second parser to keep
+// in agreement with the wire format, which is how two ingest paths drift apart.
+void UsermodRS485Bridge::registerHttpRoutes() {
+  if (httpRoutesUp) return;
+  // Body arrives via the upload/body callback; the request callback fires after the body is
+  // complete. An empty body reaches onRequest with nothing recorded, which handleHttpFrame
+  // rejects as a 400 rather than treating as a zero-length frame.
+  server.on("/hmtl", HTTP_POST,
+    [this](AsyncWebServerRequest *request) {
+      // If handleHttpFrame already answered (or parked) this request, nothing to do.
+      if (request->_tempObject == nullptr) {
+        request->send(400, F("application/json"),
+                      F("{\"status\":\"rejected\",\"error\":\"empty body\"}"));
+      }
+      request->_tempObject = nullptr;
+    },
+    nullptr,
+    [this](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      // Single-chunk only: a command frame is at most 64 bytes, so its encoded body is well under
+      // one MTU. Refusing a split body is better than reassembling one we should never see.
+      if (index != 0 || len != total) {
+        request->send(413, F("application/json"),
+                      F("{\"status\":\"rejected\",\"error\":\"body too large\"}"));
+        request->_tempObject = (void *)1;
+        return;
+      }
+      request->_tempObject = (void *)1;   // mark: this request has been dealt with
+      handleHttpFrame(request, data, len);
+    });
+  httpRoutesUp = true;
+  DEBUG_PRINTLN(F("RS485 bridge: POST /hmtl up"));
+}
+
+void UsermodRS485Bridge::handleHttpFrame(AsyncWebServerRequest *request, uint8_t *body, size_t len) {
+  if (!running) {
+    request->send(503, F("application/json"),
+                  F("{\"status\":\"rejected\",\"error\":\"bridge not running\"}"));
+    return;
+  }
+
+  // A local document, NOT WLED's shared pDoc: pDoc is lock-guarded and contended by the JSON API,
+  // and this handler runs on the AsyncTCP task where blocking on that lock would stall the server.
+  // The frame is <=64 bytes, so hex is <=128 characters and this is comfortably sized.
+  StaticJsonDocument<384> doc;
+  DeserializationError err = deserializeJson(doc, body, len);
+  // `err` alone is not enough: ArduinoJson will happily parse a bare scalar, so a body of
+  // `this is not json` can come back Ok-ish and then fail later as a missing key — reporting
+  // "missing frame" for what is really "not JSON at all". Require an object explicitly.
+  if (err || !doc.is<JsonObject>()) {
+    request->send(400, F("application/json"),
+                  F("{\"status\":\"rejected\",\"error\":\"body is not a JSON object\"}"));
+    return;
+  }
+  const char *frameStr = doc["frame"];
+  if (frameStr == nullptr) {
+    request->send(400, F("application/json"),
+                  F("{\"status\":\"rejected\",\"error\":\"missing \\\"frame\\\"\"}"));
+    return;
+  }
+  const char *encoding = doc["encoding"] | "";
+  const int   strLen   = (int)strlen(frameStr);
+
+  uint8_t frame[RS485B_TX_SLOT_LEN];
+  int flen;
+  if (strcmp(encoding, "base64") == 0) {
+    flen = rs485b_decode_base64(frameStr, strLen, frame, sizeof(frame));
+  } else if (strcmp(encoding, "hex") == 0) {
+    flen = rs485b_decode_hex(frameStr, strLen, frame, sizeof(frame));
+  } else {
+    // Auto-detect. Hex first, because the hex alphabet is a SUBSET of base64's — trying base64
+    // first would silently mis-decode every hex frame into different bytes.
+    //
+    // The fallback is guarded rather than unconditional, and that guard is the point: an input made
+    // only of hex characters that FAILS hex (odd digit count, or too long) is a broken hex string,
+    // not a base64 one. Falling through would "succeed" as base64, produce garbage bytes, and the
+    // caller would be told the FRAME failed validation — sending them to look at their frame when
+    // the real fault is their encoding. Observed on hardware: "abc" and "zzzz" both reported
+    // `frame failed validation, code 1`.
+    flen = rs485b_decode_hex(frameStr, strLen, frame, sizeof(frame));
+    if (flen <= 0 && !rs485b_looks_like_hex(frameStr, strLen))
+      flen = rs485b_decode_base64(frameStr, strLen, frame, sizeof(frame));
+  }
+  if (flen <= 0) {
+    request->send(400, F("application/json"),
+                  F("{\"status\":\"rejected\",\"error\":\"frame is not valid hex or base64\"}"));
+    return;
+  }
+
+  // Same validation the UDP ingress uses — deliberately the same call, not a parallel one. A second
+  // subtly different parser is how two paths drift, and this one closes the same truncation and
+  // oversize traps documented at usermod_rs485_bridge.h.
+  RS485BFrameResult vr = rs485b_validate_udp_ingress(frame, (uint16_t)flen, RS485B_TX_SLOT_LEN);
+  if (vr != RS485B_OK) {
+    counters.countError(vr);
+    counters.httpRejected++;
+    char buf[96];
+    snprintf(buf, sizeof(buf), "{\"status\":\"rejected\",\"error\":\"frame failed validation\",\"code\":%u}",
+             (unsigned)vr);
+    request->send(400, F("application/json"), buf);
+    return;
+  }
+  counters.httpRx++;
+
+  msg_hdr_t h;
+  memcpy(&h, frame, sizeof(h));
+  RS485BDecision d = rs485b_decide(frame, (uint16_t)flen, address, effectiveDeviceId());
+
+  // Addressed to this node: apply it here, exactly as an RS485-delivered frame would be. sourceAddr
+  // is our own address because there is no bus sender — a POLL answered this way replies to us,
+  // which is a no-op on the wire and keeps handleDecision's contract intact.
+  const bool isForUs = (d.action != RS485B_ACT_RELAY_ONLY && d.action != RS485B_ACT_DROP);
+  if (isForUs) {
+    handleDecision(d, frame, (uint8_t)flen, address);
+    request->send(200, F("application/json"),
+                  F("{\"status\":\"applied-locally\"}"));
+    return;
+  }
+
+  // Otherwise it goes on the bus.
+  if (!sendHmtlFrame(h.address, frame, h.length)) {
+    counters.txDropped++;
+    request->send(503, F("application/json"),
+                  F("{\"status\":\"rejected\",\"error\":\"transmit queue full\"}"));
+    return;
+  }
+
+  // No answer expected: the caller still gets a real guarantee ("it reached the wire"), which is
+  // strictly more than UDP gave them, and the body says so rather than implying the device acted.
+  if (!d.wantsResponse) {
+    request->send(200, F("application/json"),
+                  F("{\"status\":\"accepted-unconfirmed\",\"reason\":\"no response requested\"}"));
+    return;
+  }
+
+  // An answer IS expected. Park the request and let loop() finish it when the reply lands.
+  int slot;
+#ifdef ARDUINO_ARCH_ESP32
+  portENTER_CRITICAL(&pendingMux);
+#endif
+  slot = rs485b_pending_add(pending, h.address, h.type, millis(),
+                            RS485B_HTTP_REPLY_TIMEOUT_MS, (void *)request);
+#ifdef ARDUINO_ARCH_ESP32
+  portEXIT_CRITICAL(&pendingMux);
+#endif
+  if (slot < 0) {
+    // Table full: answer now rather than queue. Holding an async request object for an unbounded
+    // time is the leak the fixed table exists to prevent.
+    request->send(200, F("application/json"),
+                  F("{\"status\":\"accepted-unconfirmed\",\"reason\":\"too many in flight\"}"));
+    return;
+  }
+
+  // The client can vanish at any moment, and the request object is deleted on the AsyncTCP task
+  // when it does. Dropping the entry here is what stops loop() completing a response into freed
+  // memory — the failure this whole structure is arranged around.
+  request->onDisconnect([this, request]() {
+#ifdef ARDUINO_ARCH_ESP32
+    portENTER_CRITICAL(&pendingMux);
+#endif
+    rs485b_pending_cancel_ctx(pending, (void *)request);
+#ifdef ARDUINO_ARCH_ESP32
+    portEXIT_CRITICAL(&pendingMux);
+#endif
+  });
+  // Deliberately no send() here: returning without responding leaves the connection open, which is
+  // the whole point of the deferred shape.
+}
+
+// Hand an inbound RS485 frame to a waiting HTTP request, if one is waiting for exactly this.
+// Returns true if it was claimed; the caller still relays it to the UDP peer either way, so the
+// existing UDP client behaviour is unchanged by this endpoint's presence.
+bool UsermodRS485Bridge::completeHttpReply(uint16_t fromAddr, const uint8_t *frame, uint8_t frameLen) {
+  if (frameLen < sizeof(msg_hdr_t)) return false;
+  msg_hdr_t h;
+  memcpy(&h, frame, sizeof(h));
+
+  AsyncWebServerRequest *req = nullptr;
+#ifdef ARDUINO_ARCH_ESP32
+  portENTER_CRITICAL(&pendingMux);
+#endif
+  int idx = rs485b_pending_match(pending, fromAddr, h.type);
+  if (idx >= 0) {
+    req = (AsyncWebServerRequest *)pending.slot[idx].ctx;
+    // Release INSIDE the lock and before responding: once the slot is gone, a disconnect callback
+    // racing us cannot also claim this request, so only one path ever touches it.
+    rs485b_pending_release(pending, idx);
+  }
+#ifdef ARDUINO_ARCH_ESP32
+  portEXIT_CRITICAL(&pendingMux);
+#endif
+  if (req == nullptr) return false;
+
+  // Reply relayed as hex, the same encoding the request accepts, so a caller can feed a reply
+  // straight back in without re-encoding.
+  char hex[2 * RS485B_TX_SLOT_LEN + 1];
+  uint8_t n = frameLen > RS485B_TX_SLOT_LEN ? RS485B_TX_SLOT_LEN : frameLen;
+  for (uint8_t i = 0; i < n; i++) snprintf(hex + 2 * i, 3, "%02x", frame[i]);
+  hex[2 * n] = '\0';
+
+  String body = F("{\"status\":\"replied\",\"frame\":\"");
+  body += hex;
+  body += F("\"}");
+  req->send(200, F("application/json"), body);
+  counters.httpReplied++;
+  return true;
+}
+
+// Answer requests whose reply never arrived. Runs on the Arduino task from loop().
+void UsermodRS485Bridge::serviceHttpPending() {
+  for (;;) {
+    AsyncWebServerRequest *req = nullptr;
+#ifdef ARDUINO_ARCH_ESP32
+    portENTER_CRITICAL(&pendingMux);
+#endif
+    int idx = rs485b_pending_expired(pending, millis());
+    if (idx >= 0) {
+      req = (AsyncWebServerRequest *)pending.slot[idx].ctx;
+      rs485b_pending_release(pending, idx);
+    }
+#ifdef ARDUINO_ARCH_ESP32
+    portEXIT_CRITICAL(&pendingMux);
+#endif
+    if (req == nullptr) return;
+    // Falls back to exactly the guarantee shape (1) would have given, and says which one it is:
+    // the frame reached the wire, the module did not answer in time.
+    req->send(200, F("application/json"),
+              F("{\"status\":\"accepted-unconfirmed\",\"reason\":\"no reply before timeout\"}"));
+    counters.httpTimedOut++;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Info / config
 // ---------------------------------------------------------------------------------------------
 // Publish bridge status into /json/info, which is what the WLED info page renders.
@@ -533,6 +788,16 @@ void UsermodRS485Bridge::addToJsonInfo(JsonObject &root) {
     char buf2[32];
     snprintf_P(buf2, sizeof(buf2), PSTR(" / %u"), (unsigned)counters.rs485Relayed);
     udpInfo.add(buf2);
+
+    // HTTP shown beside UDP so the two ingest routes are comparable at a glance — the endpoint was
+    // added because UDP loss is silent, and "replied" is the number that says whether a command was
+    // actually confirmed rather than merely sent.
+    JsonArray httpInfo = user.createNestedArray(F("RS485 http in/replied/timeout"));
+    httpInfo.add(counters.httpRx);
+    char buf3[48];
+    snprintf_P(buf3, sizeof(buf3), PSTR(" / %u / %u"),
+               (unsigned)counters.httpReplied, (unsigned)counters.httpTimedOut);
+    httpInfo.add(buf3);
 
     const uint32_t errs = counters.errShort + counters.errStart + counters.errVersion +
                           counters.errLength + counters.errCrc + counters.errOversize;
