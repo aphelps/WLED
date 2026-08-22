@@ -54,6 +54,22 @@ static inline int rs485b_decode_hex(const char *in, int len, uint8_t *out, int o
   return n;
 }
 
+// Is every non-separator character in the hex alphabet? Used to decide whether a failed hex decode
+// should fall back to base64. An all-hex string that will not decode as hex is broken hex — saying
+// so is far more useful than silently reinterpreting it as base64 and blaming the frame.
+static inline bool rs485b_looks_like_hex(const char *in, int len) {
+  if (in == 0) return false;
+  bool any = false;
+  for (int i = 0; i < len; i++) {
+    char c = in[i];
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ':' || c == ',') continue;
+    bool isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    if (!isHex) return false;
+    any = true;
+  }
+  return any;
+}
+
 static inline int rs485b_b64_val(char c) {
   if (c >= 'A' && c <= 'Z') return c - 'A';
   if (c >= 'a' && c <= 'z') return c - 'a' + 26;

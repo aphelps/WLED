@@ -91,6 +91,28 @@ int main() {
           "hex-first must yield the hex bytes");
   }
 
+  // --- the hex/base64 fallback guard (found on hardware, not in a unit test) -------------------
+  {
+    // "abc" and "zzzz" both failed hex and then SUCCEEDED as base64, producing garbage bytes that
+    // failed frame validation — so the endpoint told the caller their FRAME was bad when their
+    // ENCODING was bad. The guard is: an all-hex string that will not decode as hex is broken hex,
+    // and must not be reinterpreted.
+    CHECK(rs485b_looks_like_hex("abc", 3), "odd-length hex is still recognisably hex");
+    CHECK(rs485b_looks_like_hex("0a 1b", 5), "separators do not disqualify it");
+    CHECK(rs485b_looks_like_hex("DEADBEEF", 8), "uppercase counts");
+    CHECK(!rs485b_looks_like_hex("zzzz", 4), "z is outside the hex alphabet");
+    CHECK(!rs485b_looks_like_hex("TWFu", 4), "a real base64 payload is not mistaken for hex");
+    CHECK(!rs485b_looks_like_hex("", 0), "empty is not hex");
+    CHECK(!rs485b_looks_like_hex("   ", 3), "separators alone are not hex");
+
+    // The property that matters: for an all-hex-but-invalid string, base64 WOULD have accepted it.
+    // That is exactly why the guard has to exist.
+    uint8_t out[16];
+    CHECK(rs485b_decode_hex("abc", 3, out, sizeof(out)) == -1, "hex rejects it");
+    CHECK(rs485b_decode_base64("abc", 3, out, sizeof(out)) > 0,
+          "but base64 accepts it — the misdirection this guard prevents");
+  }
+
   // --- the correlation property, which is the reason this table exists --------------------
   {
     RS485BPendingTable t; rs485b_pending_init(t);

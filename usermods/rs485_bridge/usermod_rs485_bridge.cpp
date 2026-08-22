@@ -565,9 +565,12 @@ void UsermodRS485Bridge::handleHttpFrame(AsyncWebServerRequest *request, uint8_t
   // The frame is <=64 bytes, so hex is <=128 characters and this is comfortably sized.
   StaticJsonDocument<384> doc;
   DeserializationError err = deserializeJson(doc, body, len);
-  if (err) {
+  // `err` alone is not enough: ArduinoJson will happily parse a bare scalar, so a body of
+  // `this is not json` can come back Ok-ish and then fail later as a missing key — reporting
+  // "missing frame" for what is really "not JSON at all". Require an object explicitly.
+  if (err || !doc.is<JsonObject>()) {
     request->send(400, F("application/json"),
-                  F("{\"status\":\"rejected\",\"error\":\"body is not JSON\"}"));
+                  F("{\"status\":\"rejected\",\"error\":\"body is not a JSON object\"}"));
     return;
   }
   const char *frameStr = doc["frame"];
@@ -586,10 +589,18 @@ void UsermodRS485Bridge::handleHttpFrame(AsyncWebServerRequest *request, uint8_t
   } else if (strcmp(encoding, "hex") == 0) {
     flen = rs485b_decode_hex(frameStr, strLen, frame, sizeof(frame));
   } else {
-    // Auto-detect: try hex, fall back to base64. Hex first because a hex string is also valid
-    // base64 alphabet, so the reverse order would silently mis-decode every hex frame.
+    // Auto-detect. Hex first, because the hex alphabet is a SUBSET of base64's — trying base64
+    // first would silently mis-decode every hex frame into different bytes.
+    //
+    // The fallback is guarded rather than unconditional, and that guard is the point: an input made
+    // only of hex characters that FAILS hex (odd digit count, or too long) is a broken hex string,
+    // not a base64 one. Falling through would "succeed" as base64, produce garbage bytes, and the
+    // caller would be told the FRAME failed validation — sending them to look at their frame when
+    // the real fault is their encoding. Observed on hardware: "abc" and "zzzz" both reported
+    // `frame failed validation, code 1`.
     flen = rs485b_decode_hex(frameStr, strLen, frame, sizeof(frame));
-    if (flen <= 0) flen = rs485b_decode_base64(frameStr, strLen, frame, sizeof(frame));
+    if (flen <= 0 && !rs485b_looks_like_hex(frameStr, strLen))
+      flen = rs485b_decode_base64(frameStr, strLen, frame, sizeof(frame));
   }
   if (flen <= 0) {
     request->send(400, F("application/json"),
