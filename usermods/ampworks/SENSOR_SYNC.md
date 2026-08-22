@@ -38,11 +38,18 @@ SensorSyncHeader (20B): magic "AMPS" | version | msgType | sensorType | dataLen
                         | deviceId(u32) | seq(u16) | ttl(u8) | flags(u8) | timestamp(u32)
 ```
 
-`msgType` is `SENSOR_SYNC_MSG_SNAPSHOT` (0) for sensor data. Every higher number is a single-hop
-router control frame — `SENSOR_SYNC_MSG_BEACON` (1) leader election, `SENSOR_SYNC_MSG_ROUTER_ADV`
-(2) a router's routing metric, `SENSOR_SYNC_MSG_ATTACH` (3) / `SENSOR_SYNC_MSG_ATTACH_ACK` (4) the
-attach handshake — and only a snapshot is ever relayed. Edges reject all of them via
-`ss_parse_header`'s msgType check. The
+`msgType` is `SENSOR_SYNC_MSG_SNAPSHOT` (0) for sensor data and `SENSOR_SYNC_MSG_CONTROL` (5) for a
+UI/preset command; **those two travel multi-hop**, as do the clock-recovery pair
+`SENSOR_SYNC_MSG_CTRL_QUERY` (7) / `SENSOR_SYNC_MSG_CTRL_CLOCK` (8) (see **Clock recovery across
+reboots** below). Numbers 1-4 are the router's own single-hop plane — `SENSOR_SYNC_MSG_BEACON` (1) leader election, `SENSOR_SYNC_MSG_ROUTER_ADV` (2) a router's
+routing metric, `SENSOR_SYNC_MSG_ATTACH` (3) / `SENSOR_SYNC_MSG_ATTACH_ACK` (4) the attach
+handshake — and are consumed by whoever hears them. `SENSOR_SYNC_MSG_TIMEBASE` (6) is reserved and
+not yet implemented.
+
+What relays is decided by one whitelist, `ss_router_is_relayable()` in the router repo, mirrored on
+the edge by the parse functions: `ss_parse_header` accepts snapshots only and `ss_parse_control`
+accepts control frames only, so an edge never receives a frame it has no handler for. Adding a
+msgType does **not** make it travel — it has to be listed in that predicate deliberately. The
 `ttl`/`flags` bytes occupy the former `reserved` u16 — still v5, still 20 bytes; legacy senders
 zeroed `reserved`, so old frames arrive `ttl=0` (a relay injects the default). See **Multi-hop
 backbone** below.
@@ -167,6 +174,94 @@ verification is tracked as `## Testing Required` on the task.
   `publish*` call from the producer. No header/version change if the layout is unchanged.
 - **New consumer:** look up the usermod, `subscribe()` once (store the cursor in your effect's
   state), `drain()` each frame. Filter by `sensorType`/`channel`.
+
+## Control plane (M4)
+
+The bus carries UI/preset commands as well as sensor data, so a phone connected to whichever node is
+in range drives the whole installation. That node acts as gateway: it applies the command locally
+and puts it on the mesh, where it fans out to every device and crosses router hops like a snapshot.
+
+**Frame.** `SENSOR_SYNC_MSG_CONTROL` (5) carrying a 16-byte `SensorControl`:
+
+```
+fields (u8)  SS_CTRL_* bitmask — which of the following are meaningful
+presetId (u8) | effectId (u8) | paletteId (u8) | brightness (u8) | rsv (u8) | rsv (u16)
+colour   (u32) 0x00WWRRGGBB
+timebase (u32) origin's Segment::timebase — RESERVED, not consumed yet
+```
+
+Header + payload is 36 bytes against an 84-byte budget, so no fragmentation and no per-node RAM
+change. The `fields` mask means "blink, on this palette, at this brightness" is **one** frame that
+applies atomically, rather than three that can interleave with a competing gateway's.
+
+A preset is applied alone and short-circuits the other fields — it carries a whole look, so applying
+individual fields on top of it would partly override what it just set.
+
+**Ordering.** Two phones on two gateways can issue conflicting commands. Ordering is by
+`(lamport, deviceId)`, where `lamport` is a **Lamport logical clock** carried in the payload: a node
+bumps it on every command it originates and raises it to any higher value it hears, including from
+commands it declines to apply. `deviceId` breaks ties. Only the current winner is remembered, not a
+per-origin table.
+
+The header's `timestamp` is deliberately **not** the ordering key, though it looks like the obvious
+candidate — an earlier version of this design used it and was wrong twice over:
+
+- It is not a shared clock. `timestamp` is `millis() + Segment::timebase`, and nothing assigns
+  `timebase` from the M3b leader; WLED's own sync rewrites it (`udp.cpp:375`) and `resetTimebase()`
+  zeroes it whenever the strip switches on. A freshly-booted node would lose every comparison for
+  days.
+- Ordering by a wall clock needs a wraparound-safe compare, and that is only an order *within a
+  half-range window*. With values spread wider than 2^31 you can have a &lt; b and b &lt; c but not
+  a &lt; c. Two nodes given the same commands in different arrival orders then settle on different
+  states **permanently** — and values exactly 2^31 apart compare neither-newer in both directions.
+
+A Lamport clock only increases, so plain comparison is a genuine total order: transitive,
+antisymmetric, and requiring no clock agreement between nodes. `sensor_control_test.cpp` pins
+transitivity, antisymmetry over the full u32 range, and convergence across **all six** arrival
+orders of three commands — two commands can converge even under a broken rule, so three is the
+smallest case that actually tests it.
+
+**Echo suppression.** A node never applies its own command coming back to it, and never re-broadcasts
+what it applied. The router's per-origin dedup stops a frame circulating the backbone, but nothing
+stops an *edge* re-originating what it applied under its own `deviceId`, which would defeat that
+dedup entirely — so the edge declines both.
+
+**Turning it on.** Publishing is opt-in per node: set `gateway: true` in the usermod's cfg.json
+block (default false). A gateway node originates a `CONTROL` frame from the `onStateChange` hook
+when a local user-driven change lands; non-gateway nodes only ever apply what they hear.
+
+**Clock recovery across reboots.** Two dedicated frames, `SENSOR_SYNC_MSG_CTRL_QUERY` (7) and
+`SENSOR_SYNC_MSG_CTRL_CLOCK` (8), let a (re)starting node ask where the mesh's Lamport clock is:
+it broadcasts a QUERY on start, peers answer with a CLOCK reply carrying their clock value only
+(never a command), and the querier adopts `max(persisted ceiling, corroborated replies)` when its
+~1.5 s window closes. Replies are corroborated per **sender**: one repeated sender is a single
+voice, and with only one voice an implausible jump falls back to the unsolicited clamp rule.
+Both frames are on the router relay whitelist so recovery crosses the backbone. Neither ever
+reaches the apply path.
+
+**Roaming.** Moving a phone to another node keeps working, and nothing reverts: control state is
+broadcast **only** on an explicit local command. No node announces its own idea of the state on
+connect, so a newly-arrived gateway cannot undo something newer. This holds by construction rather
+than by a check — see the invariant comment on `publishControl()`. Notably, control frames must
+**not** get the periodic keyframe re-broadcast snapshots use for reliability: a re-sent old command
+is indistinguishable from a new one to a node that rebooted and lost its ordering state.
+
+**Effect phase sync** is deliberately *not* implemented here. Every effect derives timing from
+`strip.now`, which WLED computes as `millis() + Segment::timebase`, and WLED's own UDP sync has
+propagated that value since its protocol v6 — so aligning effect phase across the mesh is a matter
+of agreeing on one `u32`, not of touching effects.
+
+No extra wire field is needed for it: the header's `timestamp` **already** carries
+`millis() + timebase` from the origin, which is exactly the quantity `udp.cpp:375` assigns. A future
+phase-lock sets `strip.timebase = h.timestamp - millis()` plus a delay correction. (An earlier draft
+added a `SensorControl.timebase` field for this; it was removed as redundant, and it carried the
+wrong quantity — the raw offset rather than the absolute value.) `SENSOR_SYNC_MSG_TIMEBASE` is
+reserved for a periodic beacon so late joiners can align without waiting for a command.
+
+**Where the code lives.** The wire format and msgType numbers are shared in
+`sensor_sync_protocol.h`; the decisions — validation, the ordering rule, echo suppression — are pure
+functions in `sensor_control.h`, host-tested by `tests/sensor_control_test.cpp`. Only the WLED side
+resolves conflicts; a router relays control frames without inspecting the payload.
 
 ## Multi-hop backbone
 
