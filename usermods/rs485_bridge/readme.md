@@ -206,10 +206,74 @@ payloads) is counted and ignored; nothing is ever dereferenced past the validate
 * **Relay target.** Responses and non-local traffic go to the IP/port of the most recent WiFi
   datagram. There is no peer table in v1.
 
+## HTTP command endpoint — `POST /hmtl`
+
+Send an HMTL frame over HTTP instead of raw UDP. Same validation and the same routing decision as
+the UDP path — literally the same functions, not a parallel implementation — so a frame behaves
+identically whichever way it arrives.
+
+**Why it exists.** A UDP command is unacknowledged and unretried, and one *was* observed lost in a
+four-frame burst during bench validation. The loss is silent: the sender has no way to tell. HTTP
+gives you a status code to check and, where the frame asks for an answer, the module's actual reply.
+UDP is unchanged and is still the right choice for streaming or low-latency use.
+
+```bash
+# hex, with a response requested
+curl -s -X POST http://<bridge-ip>/hmtl \
+  -H 'Content-Type: application/json' \
+  -d '{"frame":"fcda0208420000470000"}'
+
+# base64, explicit
+curl -s -X POST http://<bridge-ip>/hmtl \
+  -d '{"frame":"/NoCCEIAAEcAAA==","encoding":"base64"}'
+```
+
+`encoding` is optional — hex is tried first, then base64. Whitespace inside the string is ignored,
+so a pasted protocol dump works. An odd number of hex digits is an **error**, not a zero-pad: a
+truncated paste is far likelier than a deliberate leading zero, and a short frame on the bus is
+worse than a rejected request.
+
+### What the response tells you, and what it does not
+
+This is the part worth reading. The endpoint exists to give a guarantee UDP cannot, so the body
+always says **which** guarantee you got:
+
+| `status` | Meaning |
+|---|---|
+| `applied-locally` | The frame was addressed to this node. It was applied here; nothing went on the bus. |
+| `replied` | Forwarded, and the addressed module answered. `frame` holds its reply as hex — feed it straight back in if you need to. **This is the only status that means the device acted.** |
+| `accepted-unconfirmed` | Forwarded and it reached the transmit queue, but you are not being told the device acted. `reason` says why: no response was requested, too many requests were already in flight, or no reply arrived before the timeout. |
+| `rejected` | Never reached the bus. HTTP 400 (bad body, bad encoding, failed validation), 413 (body too large) or 503 (bridge down, or transmit queue full). |
+
+`accepted-unconfirmed` is a **strictly stronger** guarantee than UDP gave you — the frame is known
+to have reached the wire — but it is not confirmation. Treat it as "retry is safe to consider",
+not as success.
+
+### Timing
+
+A request that expects a reply is held open, not blocked. WLED's web server is asynchronous and its
+handlers must return promptly, so the request is parked and completed from the main loop when the
+reply arrives — up to `RS485B_HTTP_REPLY_TIMEOUT_MS` (1200 ms), sized above the worst-case staggered
+broadcast POLL response (~510 ms at address 255). At most `RS485B_HTTP_MAX_PENDING` (4) requests wait
+at once; a fifth is answered `accepted-unconfirmed` immediately rather than queued.
+
+Replies are correlated on **source address + message type**, oldest first. HMTL's 8-byte header
+carries no request id, so two simultaneous requests to the same address for the same type are
+genuinely indistinguishable on the wire — they are matched in issue order. A reply nothing is
+waiting for is never attributed to a waiting request; it is relayed to the UDP peer as before.
+
+### Security
+
+**None.** There is no authentication, and this endpoint can drive actuators on the bus. That is a
+deliberate decision for a trusted network (matching the bridge's existing unauthenticated UDP port),
+recorded here so it is a choice rather than an oversight. If the threat model ever changes, this and
+the UDP port are the first two things to revisit.
+
 ## Info page counters
 
 `Info → RS485 Bridge` shows the address (or `disabled` / `not built` / `error: <reason>`), then
-`RS485 rx/tx`, `RS485 udp in/relayed`, and — only when non-zero — `RS485 dropped`, broken down into
+`RS485 rx/tx`, `RS485 udp in/relayed`, `RS485 http in/replied/timeout`, and — only when non-zero —
+`RS485 dropped`, broken down into
 seven figures: bad frames, unsupported commands, transmit-queue drops, rejected datagrams, receive
 timeouts, framing errors, and refused polls.
 
@@ -239,6 +303,16 @@ The two `-I` flags point at the *real* HMTL and ArduinoLibs headers, so this dou
 acceptance check that `HMTLWireFormat.h` is genuinely dependency-free. Run it under a g++ >= 9 as
 well as clang — the two disagree about which host-portability mistakes are diagnosable.
 
+The HTTP endpoint's logic has its own suite, run the same way:
+
+```bash
+c++ -std=c++11 -Wall -Wextra -I HMTL/Libraries/HMTLprotocol -I ArduinoLibs/Socket \
+  -o /tmp/rs485_http_test WLED/usermods/rs485_bridge/tests/rs485_bridge_http_test.cpp \
+  && /tmp/rs485_http_test
+```
+
+Both run under `make test-bridge` from the super-repo root.
+
 `tests/` is excluded from the firmware build via `library.json`'s `srcFilter`.
 
 ## Files
@@ -246,6 +320,7 @@ well as clang — the two disagree about which host-portability mistakes are dia
 | File | Role |
 |------|------|
 | `rs485_bridge_protocol.h` | CRC-8, frame validation, the bridge decision function, the transmit ring buffer and the counters. Imports the wire format from HMTL (below). **No WLED/Arduino dependencies** — host unit-tested. |
+| `rs485_bridge_http.h` | The `POST /hmtl` endpoint's pure half: hex/base64 decoding and the pending-reply table that pairs an RS485 reply with the request waiting for it. **No WLED/Arduino dependencies** — host unit-tested, because every interesting failure (a reply given to the wrong request, a request completed after its client vanished, a deadline that never fires) lives here. |
 | `usermod_rs485_bridge.h` | Usermod class + the `RS485_BRIDGE_BUILD` guard. |
 | `usermod_rs485_bridge.cpp` | Transport wiring (HardwareSerial + RS485Socket + WiFiUDP), segment/brightness actions, config, and the inert placeholder for flagless builds. |
 | `tests/rs485_bridge_test.cpp` | Host unit test. |

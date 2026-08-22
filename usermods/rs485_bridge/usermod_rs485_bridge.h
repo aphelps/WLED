@@ -27,6 +27,7 @@
 #include <WiFiUdp.h>
 #include "RS485Utils.h"                // ArduinoLibs — RS485Socket over Nick Gammon's protocol
 #include "rs485_bridge_protocol.h"     // dependency-free HMTL framing + bridge decision logic
+#include "rs485_bridge_http.h"         // HTTP endpoint: body decoding + pending-reply correlation
 
 #ifndef RS485_BRIDGE_UDP_PORT
   // Follows the SENSOR_SYNC_PORT precedent (usermods/ampworks/usermod_sensor_sync.h). Must avoid
@@ -126,6 +127,13 @@ class UsermodRS485Bridge : public Usermod {
   IPAddress       peerIp;
   uint16_t        peerPort = 0;
 
+  // HTTP endpoint state. See registerHttpRoutes() for why the mux exists.
+  RS485BPendingTable pending;
+  bool               httpRoutesUp = false;
+#ifdef ARDUINO_ARCH_ESP32
+  portMUX_TYPE       pendingMux = portMUX_INITIALIZER_UNLOCKED;
+#endif
+
   // RS485Socket::sendMsgTo writes the socket header in FRONT of the caller's buffer, so the
   // backing array needs room for both. initBuffer() hands back the data region.
   uint8_t  rawTxBuf[RS485_BUFFER_TOTAL(RS485B_TX_SLOT_LEN)];
@@ -147,6 +155,22 @@ class UsermodRS485Bridge : public Usermod {
   void applyProgram(const RS485BDecision &d);   // HMTL PROGRAM -> effect / brightness / colour
   void sendPollResponse(uint16_t to);       // answer a POLL with this node's config block
   void relayToPeer(const uint8_t *frame, uint8_t frameLen);   // RS485 -> last WiFi peer
+
+  // --- HTTP command endpoint (POST /hmtl) ------------------------------------------------------
+  // Registered once the bridge is running. The decode + correlation logic lives in
+  // rs485_bridge_http.h so it can be tested without a web server; what stays here is the part that
+  // genuinely needs AsyncWebServer.
+  //
+  // CONCURRENCY, and it is load-bearing: the route handler runs on the AsyncTCP task while
+  // loop() runs on the Arduino task, and BOTH touch `pending`. The onDisconnect callback likewise
+  // fires on the AsyncTCP task, and the request object is deleted there (WebServer.cpp
+  // _handleDisconnect). So every access to the table is taken under `pendingMux`, and a slot is
+  // released BEFORE the response is sent, so no two paths can hold the same request handle.
+  void registerHttpRoutes();
+  void handleHttpFrame(AsyncWebServerRequest *request, uint8_t *body, size_t len);
+  void serviceHttpPending();   // complete requests whose reply never came
+  // Try to hand an inbound RS485 frame to a waiting HTTP request. Returns true if it was claimed.
+  bool completeHttpReply(uint16_t fromAddr, const uint8_t *frame, uint8_t frameLen);
   uint16_t effectiveDeviceId() const;       // configured id, or one derived from the MAC
 };
 

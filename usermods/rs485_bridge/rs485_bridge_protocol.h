@@ -661,6 +661,13 @@ struct RS485BCounters {
   uint32_t rs485Handled = 0;   // frames that reached a v1 action (see handleDecision's caveat)
   uint32_t rs485Relayed = 0;   // frames relayed to the WiFi peer
   uint32_t rs485Tx      = 0;   // frames written to the bus
+  // HTTP endpoint (POST /hmtl). Counted separately from the UDP path rather than folded into it:
+  // the whole reason the endpoint exists is that UDP loss is silent, so "how many commands came in
+  // by which route, and how many got a real reply" is the number the bring-up runbook needs.
+  uint32_t httpRx       = 0;   // frames accepted from HTTP (past validation)
+  uint32_t httpRejected = 0;   // frames refused before reaching the bus
+  uint32_t httpReplied  = 0;   // requests completed with a relayed RS485 reply
+  uint32_t httpTimedOut = 0;   // requests that fell back to accepted-unconfirmed
   uint32_t errShort     = 0;
   uint32_t errStart     = 0;
   uint32_t errVersion   = 0;
