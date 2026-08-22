@@ -69,6 +69,28 @@ int main() {
     CHECK(rs485b_decode_base64("TWFu", 4, tiny, sizeof(tiny)) == -1, "overflow is refused");
   }
 
+  // --- the hex-before-base64 ordering, which is easy to reverse and silent when wrong -------
+  {
+    // The hex alphabet is a SUBSET of the base64 alphabet, so a hex string is also decodable as
+    // base64 — into completely different bytes. If the endpoint's auto-detect ever tries base64
+    // first, every hex frame silently becomes a plausible wrong frame that then fails CRC, and the
+    // symptom ("it rejects everything") points nowhere near the decoder.
+    //
+    // This asserts the property that makes the order matter, so it fails if either decoder is
+    // changed such that they stop disagreeing — which is what would make the ordering look safe.
+    const char *s = "0a1b2c";
+    uint8_t asHex[16], asB64[16];
+    int nHex = rs485b_decode_hex(s, 6, asHex, sizeof(asHex));
+    int nB64 = rs485b_decode_base64(s, 6, asB64, sizeof(asB64));
+    CHECK(nHex == 3, "the sample decodes as hex");
+    CHECK(nB64 > 0, "and the SAME string is also valid base64 — this is the trap");
+    CHECK(!(nHex == nB64 && memcmp(asHex, asB64, (size_t)nHex) == 0),
+          "the two decoders genuinely disagree, so trying them in the wrong order is destructive");
+    // And the value hex must win with: 0a 1b 2c, not base64's interpretation.
+    CHECK(asHex[0] == 0x0a && asHex[1] == 0x1b && asHex[2] == 0x2c,
+          "hex-first must yield the hex bytes");
+  }
+
   // --- the correlation property, which is the reason this table exists --------------------
   {
     RS485BPendingTable t; rs485b_pending_init(t);
