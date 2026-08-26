@@ -16,6 +16,23 @@
 // _esp32s3), none of which define those flags — there the whole translation unit compiles to
 // nothing. See readme.md ("Why the build guard exists").
 #if defined(USERMOD_RS485_BRIDGE) && defined(RS485_HARDWARE_SERIAL) && defined(ARDUINO_ARCH_ESP32)
+
+// Per-board-family compile defaults (overridable via build_flags; runtime cfg still wins once saved)
+#ifndef RS485_BRIDGE_ENABLED
+  #define RS485_BRIDGE_ENABLED false
+#endif
+#ifndef RS485_BRIDGE_RX_PIN
+  #define RS485_BRIDGE_RX_PIN 16
+#endif
+#ifndef RS485_BRIDGE_TX_PIN
+  #define RS485_BRIDGE_TX_PIN 17
+#endif
+#ifndef RS485_BRIDGE_EN_PIN
+  #define RS485_BRIDGE_EN_PIN 18
+#endif
+#ifndef RS485_BRIDGE_ADDRESS
+  #define RS485_BRIDGE_ADDRESS 1
+#endif
   #define RS485_BRIDGE_BUILD 1
 #else
   #define RS485_BRIDGE_BUILD 0
@@ -105,14 +122,15 @@ class UsermodRS485Bridge : public Usermod {
   static_assert(UDP_BUF_LEN >= RS485B_TX_SLOT_LEN + RS485B_SOCKET_HDR_LEN,
                 "UDP read buffer smaller than a max frame: ERR_OVERSIZE would become unreachable");
 
-  // config
-  bool     enabled    = false;
+  // config — the compile-time defaults seed a fresh board's first cfg.json; a hardware profile
+  // (platformio env) can override them per board family so every unit boots with its real pins.
+  bool     enabled    = RS485_BRIDGE_ENABLED;
   uint8_t  uartNum    = RS485_HARDWARE_SERIAL;
-  int8_t   rxPin      = 16;
-  int8_t   txPin      = 17;
-  int8_t   enPin      = 18;
+  int8_t   rxPin      = RS485_BRIDGE_RX_PIN;
+  int8_t   txPin      = RS485_BRIDGE_TX_PIN;
+  int8_t   enPin      = RS485_BRIDGE_EN_PIN;
   uint32_t baud       = RS485Socket::DEFAULT_BAUD;   // 28000 — interoperates with legacy modules
-  uint16_t address    = 1;
+  uint16_t address    = RS485_BRIDGE_ADDRESS;
   uint16_t udpPort    = RS485_BRIDGE_UDP_PORT;
   uint16_t deviceId   = 0;                            // 0 == derive from the MAC
 

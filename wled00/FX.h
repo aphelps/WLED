@@ -38,11 +38,21 @@
   #define DEBUGFX_PRINTF_P(x...)
 #endif
 
-#define DEFAULT_BRIGHTNESS (uint8_t)127
-#define DEFAULT_MODE       (uint8_t)0
-#define DEFAULT_SPEED      (uint8_t)128
-#define DEFAULT_INTENSITY  (uint8_t)128
-#define DEFAULT_COLOR      (uint32_t)0xFFA000
+#ifndef DEFAULT_BRIGHTNESS
+  #define DEFAULT_BRIGHTNESS (uint8_t)127
+#endif
+#ifndef DEFAULT_MODE
+  #define DEFAULT_MODE       (uint8_t)0
+#endif
+#ifndef DEFAULT_SPEED
+  #define DEFAULT_SPEED      (uint8_t)128
+#endif
+#ifndef DEFAULT_INTENSITY
+  #define DEFAULT_INTENSITY  (uint8_t)128
+#endif
+#ifndef DEFAULT_COLOR
+  #define DEFAULT_COLOR      (uint32_t)0xFFA000
+#endif
 #define DEFAULT_C1         (uint8_t)128
 #define DEFAULT_C2         (uint8_t)128
 #define DEFAULT_C3         (uint8_t)16
