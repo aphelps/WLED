@@ -288,6 +288,17 @@ The last two are worth reading carefully, because they mean different things fro
   buffer was too small — that overflow happens in the peer's channel, and a half-duplex sender does
   not hear itself.
 
+  ⚠️ **A framing count of ZERO proves nothing about the wiring, and must not be read as "the line is
+  healthy".** Every `errorCount_++` in `RS485_non_blocking.cpp` sits in the `default:` arm behind
+  `if (!haveSTX_) break;` — so **nothing is counted until a valid STX byte has been seen**. A swapped
+  A/B pair delivers inverted bytes that essentially never match STX, so the receiver never starts a
+  frame and the counter stays at 0; a disconnected bus delivers no bytes and also stays at 0. The two
+  are **indistinguishable from each other and from a perfectly idle healthy bus**. Found at the bench
+  (2026-08-16) on hardware whose A/B had to be swapped, and confirmed here by reading the state
+  machine. Diagnose polarity with a meter, not with this counter — per-wire DC averaging works: with
+  `0x55` streaming, a driven pair reads ~1.6 V mid-rail on both lines, and matching voltages
+  end-to-end identify which wire is which.
+
 ## Testing
 
 Pure protocol/decision logic is host-testable with no Arduino toolchain:
