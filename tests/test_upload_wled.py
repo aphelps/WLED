@@ -98,6 +98,70 @@ check(uw.parse_http_code("\nHTTP 500\n") == 500, "parses a 5xx status line")
 check(uw.parse_http_code("") == 0, "missing status line parses as 0 (not success)")
 
 
+# --- SCons wiring: configure() across pre/post x serial/OTA -----------------
+# The decision functions above can all be right while the wiring is wrong; this
+# drives configure() the way PlatformIO does (once per registration, sharing env).
+BOTH = ["pre:tools/set_build_info.py", "pre:tools/upload_wled.py",
+        "post:tools/upload_wled.py"]
+
+
+class RecordingEnv(FakeEnv):
+    def __init__(self, upload_port, extra_scripts=BOTH):
+        super().__init__(upload_port=upload_port)
+        self.extra_scripts = extra_scripts
+        self.replaced = []
+
+    def GetProjectOption(self, name, default=None):
+        if name == "extra_scripts":
+            return list(self.extra_scripts)
+        return super().GetProjectOption(name, default)
+
+    def Replace(self, **kw):
+        self.replaced.append(kw)
+        self.update(kw)
+
+
+SERIAL, OTA = "/dev/cu.usbserial-0001", "192.168.1.55"
+
+e = RecordingEnv(SERIAL)
+uw.configure(e, environ={})
+check(e.replaced == [{"UPLOAD_PROTOCOL": "esptool"}],
+      "pre+serial: switches protocol to esptool only (got {!r})".format(e.replaced))
+check("UPLOADCMD" not in e, "pre+serial: UPLOADCMD untouched")
+e.replaced = []
+uw.configure(e, environ={})
+check(e.replaced == [], "post+serial: no Replace at all (got {!r})".format(e.replaced))
+
+e = RecordingEnv(OTA)
+uw.configure(e, environ={})
+check(e.replaced == [], "pre+OTA: no Replace (got {!r})".format(e.replaced))
+uw.configure(e, environ={})
+check(len(e.replaced) == 1 and callable(e.replaced[0].get("UPLOADCMD")),
+      "post+OTA: UPLOADCMD is the HTTP uploader (got {!r})".format(e.replaced))
+check(e.get("UPLOADCMD") is uw._upload_wled, "post+OTA: UPLOADCMD is _upload_wled")
+
+# WLED_IP with a serial --upload-port: OTA wins, so no esptool switch and the
+# HTTP uploader (and with it the preset remap) targets the IP.
+e = RecordingEnv(SERIAL)
+uw.configure(e, environ={"WLED_IP": "10.0.0.9"})
+uw.configure(e, environ={"WLED_IP": "10.0.0.9"})
+check(e.get("UPLOAD_PROTOCOL") is None and e.get("UPLOADCMD") is uw._upload_wled,
+      "WLED_IP + serial port: OTA wiring")
+
+# Registration guard: post-only (the led_driver_lora1ch restating pattern gone
+# wrong) must fail loudly instead of the silent exit-0 no-op flash.
+for scripts, label in ((["post:tools/upload_wled.py"], "post-only"),
+                       (["pre:tools/upload_wled.py"], "pre-only"),
+                       (["pre:tools/set_build_info.py"], "absent")):
+    e = RecordingEnv(SERIAL, extra_scripts=scripts)
+    try:
+        uw.configure(e, environ={})
+        check(False, "{} registration must exit".format(label))
+    except SystemExit as ex:
+        check("pre: and post:" in str(ex.code),
+              "{} registration exits naming the requirement".format(label))
+    check(e.replaced == [], "{} registration: nothing replaced".format(label))
+
 if failures:
     print("\n{} test(s) failed".format(len(failures)))
     sys.exit(1)

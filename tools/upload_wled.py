@@ -30,7 +30,8 @@ PlatformIO runs pre: scripts, then the platform build script, then post: scripts
 Doing only one of the two does not work. In particular, leaving UPLOADCMD unset
 under `upload_protocol = custom` does NOT fall back to esptool: $UPLOADCMD
 substitutes to empty, the upload target runs an empty action and EXITS 0 --
-a silent no-op "flash" on a board that was never written.
+a silent no-op "flash" on a board that was never written. configure() therefore
+refuses to run unless extra_scripts lists this file as both pre: and post:.
 
 Preset remap (OTA only): a firmware update can renumber effects (presets store the
 numeric fx id). Around an HTTP flash this script runs tools/remap_presets.py: snapshot
@@ -41,7 +42,7 @@ that was never applied (e.g. the post-flash wait timed out) is kept and used ins
 Opt out with WLED_NO_PRESET_REMAP=1. The post-flash readiness wait defaults to 60 s;
 override with WLED_REMAP_TIMEOUT=<seconds>. A remap problem only warns: the firmware is
 already flashed, so it never fails the upload. The remap lives entirely inside
-_upload_wled(), which the post pass installs only for an OTA target, so a serial flash never
+_upload_wled(), which is installed only for an OTA target, so a serial flash never
 touches it.
 """
 import os
@@ -57,12 +58,14 @@ DEFAULT_OTA_TARGET = "192.168.1.55"
 
 SNAPSHOT_KEPT = 3  # remap_presets.py snapshot: kept an earlier un-applied snapshot
 
+_SCRIPT_NAME = "upload_wled.py"
+
 
 def is_serial_target(target):
-    """True if `target` names a serial port rather than a network host.
+    r"""True if `target` names a serial port rather than a network host.
 
     Serial: POSIX device paths (/dev/cu.*, /dev/ttyUSB*, /dev/serial/by-id/*),
-    COM1..COM9, and the \\.\COMnn form Windows requires above COM9.
+    COMn (any number), and the \\.\COMnn form Windows requires above COM9.
     Everything else -- IPs, *.local, bare hostnames, empty -- is treated as OTA.
 
     Ambiguity resolves toward SERIAL on purpose: a hostname misread as serial
@@ -153,7 +156,7 @@ def run_remap(env, args, ok=(0,)):
 
 
 def _upload_wled(source, target, env):
-    """OTA upload (the post pass installs this only for a non-serial target)."""
+    """OTA upload (installed only for a non-serial target -- see configure())."""
     firmware = str(source[0])
     host = resolve_target(env)
     url = f"http://{host}/update"
@@ -203,17 +206,42 @@ def _upload_wled(source, target, env):
                     "--reboot"])
 
 
-# --- SCons wiring -----------------------------------------------------------
-# Guarded so the module stays importable by tests outside SCons, where Import()
-# and env do not exist.
-try:
-    Import("env")  # noqa: F821  (injected by SCons)
-except NameError:
-    env = None
+def _registered_phases(env):
+    """The set of phases ("pre", "post") this file is listed under in extra_scripts."""
+    try:
+        scripts = env.GetProjectOption("extra_scripts", [])
+    except Exception:
+        scripts = []
+    if isinstance(scripts, str):
+        scripts = scripts.splitlines()
+    phases = set()
+    for entry in scripts or []:
+        entry = str(entry).strip()
+        if ":" not in entry:
+            continue
+        phase, path = entry.split(":", 1)
+        if phase.strip() in ("pre", "post") and os.path.basename(path.strip()) == _SCRIPT_NAME:
+            phases.add(phase.strip())
+    return phases
 
-if env is not None:
-    _target = resolve_target(env)
-    _serial = is_serial_target(_target)
+
+def configure(env, environ=None):
+    """Wire the upload for this SCons pass. Called once per registration (pre, then post).
+
+    The first call is the pre pass ONLY if extra_scripts really lists a pre: entry for
+    this file; a child env that restates extra_scripts with just the post: entry would
+    otherwise run the pre branch in the post pass -- too late to switch the protocol,
+    UPLOADCMD never installed, and `-t upload` exits 0 having flashed nothing. So the
+    registration is asserted, not assumed, and a bad one fails the build loudly.
+    """
+    if not env.get("_WLED_UPLOAD_PRE_DONE"):
+        missing = {"pre", "post"} - _registered_phases(env)
+        if missing:
+            sys.exit(
+                "{} must be registered in extra_scripts as BOTH pre: and post: "
+                "(missing: {}) -- see its module docstring.".format(
+                    _SCRIPT_NAME, ", ".join(sorted(missing))))
+    _serial = is_serial_target(resolve_target(env, environ))
     if not env.get("_WLED_UPLOAD_PRE_DONE"):
         # PRE pass: hand serial uploads to the platform's own esptool path.
         env["_WLED_UPLOAD_PRE_DONE"] = True
@@ -223,3 +251,15 @@ if env is not None:
         # POST pass: OTA only. Never replace UPLOADCMD for a serial target -- that
         # is what the platform builder has just assembled.
         env.Replace(UPLOADCMD=_upload_wled)
+
+
+# --- SCons wiring -----------------------------------------------------------
+# Guarded so the module stays importable by tests outside SCons, where Import()
+# and env do not exist.
+try:
+    Import("env")  # noqa: F821  (injected by SCons)
+except NameError:
+    env = None
+
+if env is not None:
+    configure(env)
