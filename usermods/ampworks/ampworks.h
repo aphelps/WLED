@@ -4,7 +4,9 @@
  * AMPWorks WLED usermod.
  *
  * Registers custom LED effects with the WLED effect engine. Effects are
- * implemented in ampworks.cpp and added to the strip in setup().
+ * implemented in ampworks.cpp and added to the strip in setup(), each pinned to a fixed
+ * effect id (240+, see AMP_FX_SLOTS in ampworks.cpp and fx_slot.h) so saved presets keep
+ * pointing at the right effect across upstream WLED updates.
  *
  * Enabled via -D USERMOD_AMPWORKS in the ampworks PlatformIO environment.
  * Effects that use the MPR121 touch sensor also require -D USERMOD_MPR121.
@@ -25,10 +27,7 @@ class AMPWorks : public Usermod {
     void loop() override {}
     void connected() override {}
 
-    void addToJsonInfo(JsonObject& root) override {
-      JsonObject user = root["u"];
-      if (user.isNull()) user = root.createNestedObject("u");
-    }
+    void addToJsonInfo(JsonObject& root) override;  // reports effects that failed to pin
 
     void addToConfig(JsonObject& root) override {
       root.createNestedObject(FPSTR(_name));
