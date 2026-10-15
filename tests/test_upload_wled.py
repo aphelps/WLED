@@ -162,6 +162,100 @@ for scripts, label in ((["post:tools/upload_wled.py"], "post-only"),
               "{} registration exits naming the requirement".format(label))
     check(e.replaced == [], "{} registration: nothing replaced".format(label))
 
+# --- _upload_wled() itself: the 2xx gate on remap apply, and curl failure ------
+# The wiring matrix proves _upload_wled is installed only for OTA; this drives the
+# uploader with subprocess.run and run_remap stubbed, so the gate that keeps a
+# remap `apply` (which reboots the device) away from a rejected flash is pinned.
+import types
+
+
+class UploadEnv(FakeEnv):
+    def subst(self, s):
+        if s == "$BUILD_DIR":
+            return self["BUILD_DIR"]
+        return super().subst(s)
+
+
+def drive_upload(curl_rc, curl_stdout, snapshot_rc=0, environ=None):
+    """Run _upload_wled() against an OTA FakeEnv. Returns (remap_calls, curl_argvs,
+    exit_code) where exit_code is None unless it raised SystemExit."""
+    remap_calls, curl_argvs = [], []
+
+    def fake_run(argv, **kw):
+        curl_argvs.append(list(argv))
+        return types.SimpleNamespace(returncode=curl_rc, stdout=curl_stdout)
+
+    def fake_remap(env, args, ok=(0,)):
+        remap_calls.append(list(args))
+        return snapshot_rc if args[0] == "snapshot" else 0
+
+    saved_run, saved_remap = uw.subprocess.run, uw.run_remap
+    keys = ("WLED_IP", "WLED_NO_PRESET_REMAP", "WLED_REMAP_TIMEOUT")
+    saved_env = {k: os.environ.get(k) for k in keys}
+    for k in keys:
+        os.environ.pop(k, None)
+    os.environ.update(environ or {})
+    uw.subprocess.run, uw.run_remap = fake_run, fake_remap
+    env = UploadEnv(upload_port=OTA)
+    env["BUILD_DIR"] = "/tmp/build"
+    exit_code = None
+    try:
+        uw._upload_wled(["/tmp/firmware.bin"], None, env)
+    except SystemExit as ex:
+        exit_code = ex.code
+    finally:
+        uw.subprocess.run, uw.run_remap = saved_run, saved_remap
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return remap_calls, curl_argvs, exit_code
+
+
+def steps(calls):
+    return [c[0] for c in calls]
+
+
+calls, argvs, rc = drive_upload(0, "\nHTTP 200\n")
+check(steps(calls) == ["snapshot", "apply"],
+      "HTTP 200: snapshot then apply (got {!r})".format(steps(calls)))
+check(rc is None, "HTTP 200: no exit")
+check(argvs == [uw.build_curl_argv("/tmp/firmware.bin", OTA)],
+      "HTTP 200: curl ran once with the build_curl_argv() argv")
+if len(calls) == 2:
+    check(calls[1][1] == OTA and "--wait-since" in calls[1] and "--reboot" in calls[1],
+          "HTTP 200: apply targets the host, waits for the reboot, reboots once")
+    check(calls[0][2] == calls[1][2] == os.path.join("/tmp/build", "preset_remap", OTA),
+          "snapshot and apply share the per-host snapdir")
+
+for status in ("HTTP 500", "HTTP 404", ""):
+    calls, argvs, rc = drive_upload(0, "\n{}\n".format(status))
+    check(steps(calls) == ["snapshot"],
+          "{!r}: snapshot only, NO apply (got {!r})".format(status, steps(calls)))
+    check(rc is None, "{!r}: curl rc 0 does not exit".format(status))
+
+calls, argvs, rc = drive_upload(1, "")
+check(rc == 1, "curl rc 1 -> exit 1 (got {!r})".format(rc))
+check(steps(calls) == ["snapshot"], "curl rc 1: no apply (got {!r})".format(steps(calls)))
+calls, argvs, rc = drive_upload(28, "\nHTTP 200\n")   # timeout, even with a stray 200 line
+check(rc == 1, "curl rc 28 -> exit 1 even if stdout mentions 200 (got {!r})".format(rc))
+check("apply" not in steps(calls), "curl rc 28: no apply")
+
+# Snapshot outcomes: a kept earlier snapshot (rc 3) still proceeds to apply; a failed
+# snapshot skips the remap entirely but the upload still runs.
+calls, argvs, rc = drive_upload(0, "\nHTTP 200\n", snapshot_rc=uw.SNAPSHOT_KEPT)
+check(steps(calls) == ["snapshot", "apply"],
+      "kept snapshot (rc 3): apply still runs (got {!r})".format(steps(calls)))
+calls, argvs, rc = drive_upload(0, "\nHTTP 200\n", snapshot_rc=2)
+check(steps(calls) == ["snapshot"], "failed snapshot: no apply (got {!r})".format(steps(calls)))
+check(len(argvs) == 1, "failed snapshot: upload still runs")
+
+# Opt-out: no remap calls at all.
+calls, argvs, rc = drive_upload(0, "\nHTTP 200\n", environ={"WLED_NO_PRESET_REMAP": "1"})
+check(calls == [] and len(argvs) == 1, "WLED_NO_PRESET_REMAP=1: upload, no remap")
+
+
 if failures:
     print("\n{} test(s) failed".format(len(failures)))
     sys.exit(1)
