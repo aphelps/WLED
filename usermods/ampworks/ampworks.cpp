@@ -9,6 +9,7 @@
 // sqrt16) via WLED-16 natives so the effect code below is unchanged. See fastled_compat.h.
 #include "colors.h"          // scale8/qadd8/qsub8/color_fade (bundled fastled_slim)
 #include "fastled_compat.h"  // random8/random16/map8/beatsin8/sqrt16 → WLED-16 natives
+#include "fx_slot.h"         // pinEffect(): place an effect at a fixed id via stock addEffect
 
 /*
  * AMP's initial test mode
@@ -738,18 +739,88 @@ static const char _data_FX_MODE_TOUCH_GRID[] PROGMEM =
 const char AMPWorks::_name[]    PROGMEM = "AMPWorks";
 const char AMPWorks::_enabled[] PROGMEM = "enabled";
 
+// Filler effect for the padding slots pinEffect() adds below our pinned ids. Never actually
+// runs: those slots are named "RSVD..." and Segment::setMode skips RSVD ids.
+static void mode_amp_reserved(void) {
+  SEGMENT.fill(BLACK);
+}
+
+// Fixed effect ids for the AMPWorks effects. Saved presets store these numbers, so:
+//   - never renumber or reuse an id, even after deleting an effect;
+//   - add a new effect at the next unused id (247, 248, ...).
+// 246 is reserved for AMP Test (mode_amp_test, currently not registered).
+// Upstream WLED had 220 built-ins (MODE_COUNT) when these were chosen; if it ever grows
+// past 240 the pins fail and setup() reports it in /json/info (see readme.md).
+struct AmpFxSlot {
+  uint8_t id;
+  void (*fn)(void);  // same signature as WS2812FX::mode_ptr
+  const char *data;
+};
+static const AmpFxSlot AMP_FX_SLOTS[] = {
+  {240, &mode_amp_ai,         _data_FX_MODE_AMP_AI},
+  {241, &mode_amp_ai_audio,   _data_FX_MODE_AMP_AI_AUDIO},
+  {242, &mode_amp_moving_sin, _data_FX_MODE_AMP_MOVING_SIN},
+  {243, &mode_hmtl_sparkle,   _data_FX_MODE_HMTL_SPARKLE},
+  {244, &mode_touch_ripple,   _data_FX_MODE_TOUCH_RIPPLE},   // "Touch Pond"
+  {245, &mode_touch_grid,     _data_FX_MODE_TOUCH_GRID},
+  // {246, &mode_amp_test,    _data_FX_MODE_AMP_TEST},
+};
+static const size_t AMP_FX_SLOT_COUNT = sizeof(AMP_FX_SLOTS) / sizeof(AMP_FX_SLOTS[0]);
+
+// Effects that did not land on their pinned id this boot (index into AMP_FX_SLOTS, and the id
+// addEffect actually returned). Reported by addToJsonInfo() so a collision is visible.
+static uint8_t ampFxPinFailIdx[AMP_FX_SLOT_COUNT];
+static uint8_t ampFxPinFailGot[AMP_FX_SLOT_COUNT];
+static uint8_t ampFxPinFailCount = 0;
+
+// Copy the display name (text before '@') of a PROGMEM effect data string into buf.
+static void ampFxName(const char *data, char *buf, size_t len) {
+  size_t i = 0;
+  for (; i + 1 < len; i++) {
+    char c = pgm_read_byte(data + i);
+    if (c == '\0' || c == '@') break;
+    buf[i] = c;
+  }
+  buf[i] = '\0';
+}
+
 void AMPWorks::setup() {
   //Serial.println("Hello from my usermod!");
 
-  // strip.addEffect(255, &mode_amp_test, _data_FX_MODE_AMP_TEST);
-  strip.addEffect(255, &mode_amp_ai, _data_FX_MODE_AMP_AI); // register AMP AI mode
-  strip.addEffect(255, &mode_amp_ai_audio, _data_FX_MODE_AMP_AI_AUDIO); // register AMP AI audio mode
-  strip.addEffect(255, &mode_amp_moving_sin, _data_FX_MODE_AMP_MOVING_SIN);
-  strip.addEffect(255, &mode_hmtl_sparkle, _data_FX_MODE_HMTL_SPARKLE);
-  strip.addEffect(255, &mode_touch_ripple, _data_FX_MODE_TOUCH_RIPPLE);
-  strip.addEffect(255, &mode_touch_grid, _data_FX_MODE_TOUCH_GRID);
+  ampFxPinFailCount = 0;
+  for (size_t i = 0; i < AMP_FX_SLOT_COUNT; i++) {
+    const AmpFxSlot &slot = AMP_FX_SLOTS[i];
+    uint8_t got = pinEffect(strip, slot.id, slot.fn, slot.data, &mode_amp_reserved);
+    if (got != slot.id) {
+      char name[32];
+      ampFxName(slot.data, name, sizeof(name));
+      DEBUG_PRINTF_P(PSTR("ERROR AMPWorks: effect %s failed to pin at %u (addEffect returned %u)\n"),
+                     name, slot.id, got);
+      ampFxPinFailIdx[ampFxPinFailCount] = i;
+      ampFxPinFailGot[ampFxPinFailCount] = got;
+      ampFxPinFailCount++;
+    }
+  }
 
   initDone = true;
+}
+
+void AMPWorks::addToJsonInfo(JsonObject& root) {
+  JsonObject user = root["u"];
+  if (user.isNull()) user = root.createNestedObject("u");
+  // One line per effect that failed to pin, e.g.
+  //   "AMPWorks: effect Touch Pond" : ["failed to pin at 244 (got 255)"]
+  for (uint8_t f = 0; f < ampFxPinFailCount; f++) {
+    const AmpFxSlot &slot = AMP_FX_SLOTS[ampFxPinFailIdx[f]];
+    char name[32];
+    ampFxName(slot.data, name, sizeof(name));
+    char key[48];
+    snprintf_P(key, sizeof(key), PSTR("AMPWorks: effect %s"), name);
+    char msg[48];
+    snprintf_P(msg, sizeof(msg), PSTR("failed to pin at %u (got %u)"), slot.id, ampFxPinFailGot[f]);
+    JsonArray line = user.createNestedArray(key);  // ArduinoJson copies a char* key
+    line.add(msg);                                 // ... and a char* value
+  }
 }
 
 // WLED 16.x self-registration (replaces the old central usermods_list.cpp).
